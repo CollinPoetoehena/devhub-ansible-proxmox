@@ -1,0 +1,5 @@
+---
+# tasks file for devhub-ansible-proxmox
+
+# TODO: create the tasks and run it against my laptop, etc.
+# TODO: the template has the network interfaces setup that did work before, but change this to use Ansible tasks, etc.

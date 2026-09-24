@@ -1,0 +1,15 @@
+galaxy_info:
+  author: CollinPoetoehena
+  description: Configure a Proxmox host with Ansible for lab networking and management
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+  galaxy_tags:
+    - homelab
+    - proxmox
+    - virtualization
+    - lab-management
+
+dependencies: []

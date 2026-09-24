@@ -1,0 +1,9 @@
+---
+# vars file for devhub-ansible-proxmox
+#
+# Variables defined here have higher precedence than defaults/main.yml and
+# cannot be overridden by inventory variables. Use this for values that should
+# NOT be changed per-host (internal constants, computed values, etc.).
+#
+# Currently empty — all configurable values are in defaults/main.yml so they
+# can be overridden in group_vars or host_vars as needed.

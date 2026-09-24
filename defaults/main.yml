@@ -1,0 +1,23 @@
+---
+# defaults file for devhub-ansible-proxmox
+#
+# Generic defaults that work for any deployment. Site-specific values
+# MUST be set in group_vars/proxmox/ or host_vars/.
+
+################################################################################
+# Network Interfaces
+################################################################################
+# The physical network interface on the Proxmox host. This is the NIC that will be attached to the main bridge (vmbr0).
+# Check with `ip link` or `ls /sys/class/net/` to find the correct interface name on the Proxmox host.
+pve_physical_interface: "nic0"
+
+################################################################################
+# LAN Network Configuration (Lab Network)
+# --- REQUIRED: override in group_vars/proxmox/ ---
+################################################################################
+# Static IP of the Proxmox management interface (vmbr0.10)
+# pve_mgmt_ip: 10.42.10.10
+# Netmask of the Proxmox management interface (vmbr0.10)
+# pve_mgmt_netmask: 255.255.255.0
+# Gateway of the Proxmox management interface (vmbr0.10)
+# pve_mgmt_gateway: 10.42.10.1
