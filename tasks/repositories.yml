@@ -1,0 +1,172 @@
+---
+# repositories.yml — Point APT at the free no-subscription repository.
+#
+################################################################################
+# The problem this solves
+################################################################################
+# A stock Proxmox VE install enables `pve-enterprise`, which requires a paid
+# subscription key. Without one, every `apt update` ends in:
+#
+#   401 Unauthorized [IP: ... 443]
+#   E: The repository 'https://enterprise.proxmox.com/... ' is not signed.
+#
+# and apt then refuses to install ANYTHING — including the packages this role
+# needs. So fixing the repositories must happen before any package task.
+#
+# The no-subscription repository ships the same packages with slightly less
+# testing. That is the correct trade-off for a homelab and the officially
+# documented path for non-production use. It must NOT be used on a node covered
+# by a support contract.
+#
+# FORMAT NOTE: Proxmox VE 9 (Debian 13 "trixie") moved to deb822-style
+# `.sources` files; PVE 8 and earlier used one-line entries in
+# `/etc/apt/sources.list.d/*.list`. Both layouts are handled below, selected by
+# proxmox_use_deb822_sources, so the same role works on either release.
+
+################################################################################
+# Disable the enterprise repositories
+################################################################################
+- name: Find enterprise repository files (both formats)
+  ansible.builtin.find:
+    paths: /etc/apt/sources.list.d
+    patterns:
+      - "pve-enterprise.list"
+      - "pve-enterprise.sources"
+      - "ceph.list"
+      - "ceph.sources"
+  register: proxmox_enterprise_repo_files
+  when: proxmox_disable_enterprise_repo
+
+- name: Disable enterprise repositories (deb822 format)
+  ansible.builtin.lineinfile:
+    path: "{{ item.path }}"
+    regexp: '^Enabled:'
+    line: 'Enabled: false'
+    create: false
+  loop: "{{ proxmox_enterprise_repo_files.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when:
+    - proxmox_disable_enterprise_repo
+    - item.path is search('\.sources$')
+  # deb822 has an explicit Enabled: key, so the file can stay in place (and
+  # keep documenting that the repo exists) while being inert.
+
+- name: Disable enterprise repositories (one-line .list format)
+  ansible.builtin.replace:
+    path: "{{ item.path }}"
+    regexp: '^(?!#)(deb\s+.*enterprise\.proxmox\.com.*)$'
+    replace: '# \1   # disabled by Ansible: no subscription in this lab'
+  loop: "{{ proxmox_enterprise_repo_files.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when:
+    - proxmox_disable_enterprise_repo
+    - item.path is search('\.list$')
+  # Commented rather than deleted: the file is recreated by package upgrades,
+  # and a commented line makes it obvious to a human what happened and why.
+
+################################################################################
+# Enable the no-subscription repository
+################################################################################
+- name: Deploy the no-subscription repository (deb822 .sources)
+  ansible.builtin.template:
+    src: pve-no-subscription.sources.j2
+    dest: /etc/apt/sources.list.d/pve-no-subscription.sources
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  when:
+    - proxmox_use_no_subscription_repo
+    - proxmox_use_deb822_sources
+  notify: Update apt cache
+
+- name: Deploy the no-subscription repository (one-line .list)
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/pve-no-subscription.list
+    content: |
+      # {{ ansible_managed }}
+      # Free Proxmox VE repository — no subscription key required.
+      deb http://download.proxmox.com/debian/pve {{ proxmox_debian_suite }} pve-no-subscription
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  when:
+    - proxmox_use_no_subscription_repo
+    - not proxmox_use_deb822_sources
+  notify: Update apt cache
+
+- name: Remove the other repository format if it is left over from a previous run
+  ansible.builtin.file:
+    path: "{{ '/etc/apt/sources.list.d/pve-no-subscription.list' if proxmox_use_deb822_sources else '/etc/apt/sources.list.d/pve-no-subscription.sources' }}"
+    state: absent
+  notify: Update apt cache
+  # Having the same repository defined twice, in two formats, produces a
+  # "configured multiple times" apt warning and duplicate index downloads.
+
+- name: Update the apt cache now (later tasks install packages)
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  register: proxmox_apt_update
+  retries: 3
+  delay: 5
+  until: proxmox_apt_update is succeeded
+  # Retried because a node that has just come up may still be waiting for its
+  # DHCP lease / RA from the router when the first attempt runs.
+
+################################################################################
+# Full upgrade
+################################################################################
+- name: Perform a full distribution upgrade
+  ansible.builtin.apt:
+    upgrade: dist
+    autoremove: true
+  when: proxmox_perform_dist_upgrade
+  register: proxmox_dist_upgrade
+  # This is what actually pulls the node onto the no-subscription packages
+  # after the repository switch above.
+
+- name: Check whether a reboot is required (new kernel)
+  ansible.builtin.stat:
+    path: /var/run/reboot-required
+  register: proxmox_reboot_required
+
+- name: Report that a reboot is pending
+  ansible.builtin.debug:
+    msg: >-
+      A reboot is required on {{ inventory_hostname }} (new kernel installed).
+      This role does NOT reboot automatically — a hypervisor reboot stops every
+      running VM. Reboot manually when convenient:  ssh ... 'sudo systemctl reboot'
+  when: proxmox_reboot_required.stat.exists
+
+################################################################################
+# Subscription nag
+################################################################################
+# The web UI shows a modal dialog on every login when no subscription is
+# present. Patching the JS file is cosmetic, but it is re-applied by every
+# proxmox-widget-toolkit upgrade — which is exactly why it belongs in a role
+# rather than being a one-off manual edit that silently reverts.
+- name: Remove the "no valid subscription" popup
+  ansible.builtin.replace:
+    path: /usr/share/javascript/proxmox-integration/proxmoxlib.js
+    regexp: "(\\s+)(Ext.Msg.show\\(\\{\\s+title: gettext\\('No valid sub)"
+    replace: "\\1void({ //\\2"
+    backup: true
+  when: proxmox_remove_subscription_nag
+  failed_when: false
+  notify: Restart pveproxy
+  # failed_when: false — the path and the exact JS snippet change between
+  # releases. A cosmetic patch must never fail the run.
+
+- name: Remove the "no valid subscription" popup (alternate path used by PVE 8)
+  ansible.builtin.replace:
+    path: /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
+    regexp: "(\\s+)(Ext.Msg.show\\(\\{\\s+title: gettext\\('No valid sub)"
+    replace: "\\1void({ //\\2"
+    backup: true
+  when: proxmox_remove_subscription_nag
+  failed_when: false
+  notify: Restart pveproxy

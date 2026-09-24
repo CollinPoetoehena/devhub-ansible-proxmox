@@ -1,0 +1,112 @@
+---
+# storage.yml — Storage content types, snippets directory and image cache.
+#
+################################################################################
+# Why this file exists at all
+################################################################################
+# Proxmox storages have a `content` list that declares WHAT may be stored on
+# them: images (VM disks), iso, vztmpl (container templates), backup, snippets.
+# A storage silently refuses anything not in that list.
+#
+# `snippets` is the one that matters for automation, and it is NOT enabled by
+# default. Cloud-init user-data written by Terraform is uploaded as a snippet;
+# without the content type the upload fails (or, worse, the VM boots with the
+# default cloud-init config and none of your users, keys or packages) — the
+# classic "cloud-init did nothing" symptom.
+
+################################################################################
+# Enable the snippets content type
+################################################################################
+- name: Read the current storage configuration
+  ansible.builtin.command:
+    cmd: "pvesm status --storage {{ proxmox_snippets_storage }}"
+  register: proxmox_snippet_storage_status
+  changed_when: false
+  failed_when: false
+
+- name: Fail with a clear message if the snippets storage does not exist
+  ansible.builtin.fail:
+    msg: >-
+      Storage "{{ proxmox_snippets_storage }}" does not exist on
+      {{ inventory_hostname }}. Set proxmox_snippets_storage to a DIRECTORY
+      storage that exists on this node (`pvesm status` lists them). Snippets
+      require a directory-backed storage — an LVM-thin pool such as local-lvm
+      cannot hold files.
+  when:
+    - proxmox_enable_snippets
+    - proxmox_snippet_storage_status.rc != 0
+
+- name: Get the current content types of the snippets storage
+  ansible.builtin.shell:
+    cmd: "set -o pipefail; grep -A 10 '^dir: {{ proxmox_snippets_storage }}$' /etc/pve/storage.cfg | grep -m1 'content' | sed 's/.*content //'"
+    executable: /bin/bash
+  register: proxmox_snippet_content
+  changed_when: false
+  failed_when: false
+
+- name: Enable the snippets content type on {{ proxmox_snippets_storage }}
+  ansible.builtin.command:
+    cmd: >-
+      pvesm set {{ proxmox_snippets_storage }}
+      --content {{ ((proxmox_snippet_content.stdout | default('') | trim | split(',')) + ['snippets'])
+                   | reject('equalto', '') | unique | join(',') }}
+  when:
+    - proxmox_enable_snippets
+    - "'snippets' not in (proxmox_snippet_content.stdout | default(''))"
+  changed_when: true
+  notify: Restart pvedaemon
+  # The existing content list is PRESERVED and snippets is appended. Passing
+  # only --content snippets would REPLACE the list and silently make the
+  # storage stop accepting ISOs and backups.
+
+- name: Ensure the snippets directory exists with the right ownership
+  ansible.builtin.file:
+    path: "/var/lib/vz/snippets"
+    state: directory
+    owner: root
+    group: "www-data"
+    mode: "0775"
+  when: proxmox_enable_snippets
+  # Group www-data + group-writable: pvedaemon runs as www-data and must be
+  # able to write snippets uploaded through the API, while the SSH automation
+  # user writes them directly via scp/sudo tee.
+
+################################################################################
+# Cloud image cache
+################################################################################
+# Downloaded cloud images are kept on the node so that rebuilding a template
+# does not re-download several hundred MB, and so a template can be rebuilt
+# without internet access.
+- name: Ensure the cloud image cache directory exists
+  ansible.builtin.file:
+    path: "{{ proxmox_image_cache_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+################################################################################
+# Sanity check the VM disk storage
+################################################################################
+- name: Verify the VM disk storage exists
+  ansible.builtin.command:
+    cmd: "pvesm status --storage {{ proxmox_vm_storage }}"
+  register: proxmox_vm_storage_status
+  changed_when: false
+  failed_when: false
+
+- name: Fail if the configured VM storage is missing
+  ansible.builtin.fail:
+    msg: >-
+      Storage "{{ proxmox_vm_storage }}" does not exist on {{ inventory_hostname }}.
+      This is the storage the Terraform module allocates VM disks on
+      (var.datastore_id). Available storages:
+      {{ proxmox_all_storages.stdout_lines | default(['(unknown)']) | join(', ') }}
+  when: proxmox_vm_storage_status.rc != 0
+
+- name: List all storages (for the summary)
+  ansible.builtin.command:
+    cmd: "pvesm status"
+  register: proxmox_all_storages
+  changed_when: false
+  failed_when: false

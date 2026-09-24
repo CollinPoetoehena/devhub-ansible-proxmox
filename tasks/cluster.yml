@@ -1,0 +1,105 @@
+---
+# cluster.yml — Create or join the Proxmox cluster.
+#
+################################################################################
+# Why clustering is OFF by default in this lab
+################################################################################
+# Proxmox clustering uses corosync, which requires QUORUM: a strict majority of
+# votes must be present for the cluster filesystem (/etc/pve) to be writable.
+# In a TWO-node cluster the majority is 2, so if either node is powered off the
+# survivor has 1 of 2 votes, loses quorum, and /etc/pve goes read-only — which
+# means no VM can be started, created or modified on a node that is otherwise
+# perfectly healthy.
+#
+# In a homelab where the second machine is often switched off, that is strictly
+# worse than two independent standalone nodes. So:
+#   - PVE1 alone            -> proxmox_cluster_enabled: false (correct today)
+#   - PVE1 + PVE2 always on -> enable clustering
+#   - PVE1 + PVE2 sometimes -> enable clustering AND add a QDevice (a third
+#                              vote from a tiny always-on machine; the lab
+#                              router is the obvious candidate) so the cluster
+#                              keeps quorum with one node down.
+#
+# WARNING: joining a node to a cluster DESTROYS any VMs already defined on it.
+# That is a Proxmox constraint, not a limitation of this role. Cluster first,
+# create VMs second.
+
+- name: Check whether this node is already in a cluster
+  ansible.builtin.command:
+    cmd: "pvecm status"
+  register: proxmox_cluster_status
+  changed_when: false
+  failed_when: false
+
+- name: Set a fact for cluster membership
+  ansible.builtin.set_fact:
+    proxmox_in_cluster: "{{ proxmox_cluster_status.rc == 0 }}"
+
+- name: Refuse to join a node that already has VMs defined
+  block:
+    - name: List VMs on this node
+      ansible.builtin.command:
+        cmd: "qm list"
+      register: proxmox_vms_present
+      changed_when: false
+
+    - name: Fail if VMs exist on a node that is about to join a cluster
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }} has VMs defined but is not yet in the cluster.
+          Joining a cluster wipes the local VM configuration. Back up or remove
+          the VMs first, then re-run with --tags cluster.
+      when:
+        - proxmox_vms_present.stdout_lines | length > 1
+        - inventory_hostname != proxmox_cluster_primary
+  when: not proxmox_in_cluster
+
+################################################################################
+# Create the cluster (primary node only)
+################################################################################
+- name: Create the cluster on the primary node
+  ansible.builtin.command:
+    cmd: >-
+      pvecm create {{ proxmox_cluster_name }}
+      --link0 {{ proxmox_cluster_link_address }}
+  when:
+    - not proxmox_in_cluster
+    - inventory_hostname == proxmox_cluster_primary
+  changed_when: true
+  # --link0 pins corosync to the MANAGEMENT VLAN address. Left to itself,
+  # corosync picks whatever address the hostname resolves to, which on a
+  # multi-homed hypervisor can be a VM-facing interface. Cluster traffic is
+  # latency-sensitive and must stay on the admin plane.
+
+- name: Wait for the cluster to become quorate on the primary
+  ansible.builtin.command:
+    cmd: "pvecm status"
+  register: proxmox_cluster_quorum
+  until: "'Quorate: Yes' in proxmox_cluster_quorum.stdout"
+  retries: 12
+  delay: 5
+  changed_when: false
+  when: inventory_hostname == proxmox_cluster_primary
+
+################################################################################
+# Join (every other node)
+################################################################################
+# Joining is interactive by default (it asks for the primary's root password
+# and to confirm the SSH fingerprint). It therefore cannot be fully automated
+# without storing the root password, which this role deliberately does not do.
+- name: Print the join command for the secondary nodes
+  ansible.builtin.debug:
+    msg:
+      - "{{ inventory_hostname }} is not in cluster '{{ proxmox_cluster_name }}'."
+      - "Joining requires the primary node's root password, which this role does not store."
+      - "Run this ON {{ inventory_hostname }} once:"
+      - "  pvecm add {{ hostvars[proxmox_cluster_primary].proxmox_mgmt_ipv4 | default(proxmox_cluster_primary) }} --link0 {{ proxmox_cluster_link_address }}"
+      - "Then re-run this role; every later task is cluster-aware."
+  when:
+    - not proxmox_in_cluster
+    - inventory_hostname != proxmox_cluster_primary
+
+- name: Report the cluster status
+  ansible.builtin.debug:
+    msg: "{{ proxmox_cluster_status.stdout_lines | default(['not clustered']) }}"
+  when: proxmox_in_cluster

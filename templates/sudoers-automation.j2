@@ -1,0 +1,24 @@
+# {{ ansible_managed }}
+#
+# Restricted sudo for the Terraform automation SSH account.
+#
+# WHY this is not "{{ proxmox_automation_ssh_user }} ALL=(root) NOPASSWD: ALL":
+# the whole point of the least-privilege API role (TerraformProv) is that the
+# automation cannot reconfigure the hypervisor. Blanket root sudo over SSH
+# would hand back exactly the privileges the API role withholds, through a
+# different door.
+#
+# The commands below are the ones the bpg/proxmox provider actually invokes
+# over SSH: storage operations (pvesm), VM disk operations (qm), and writing
+# cloud-init snippets. Anything else requires a human.
+#
+# SYNTAX: user  host=(runas) NOPASSWD: command1, command2
+#   NOPASSWD  - no password prompt (there is no password; this is a key-only
+#               account and a prompt would simply hang an automated run)
+{% for cmd in proxmox_automation_sudo_commands %}
+{{ proxmox_automation_ssh_user }} ALL=(root) NOPASSWD: {{ cmd }}
+{% endfor %}
+
+# Do not require a TTY for this user. Debian's default `Defaults requiretty`
+# (where present) breaks non-interactive SSH command execution.
+Defaults:{{ proxmox_automation_ssh_user }} !requiretty

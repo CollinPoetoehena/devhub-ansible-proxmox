@@ -1,0 +1,57 @@
+---
+# packages.yml — Utility and dependency packages for a Proxmox node.
+#
+# Split from the Proxmox packages themselves (which the ISO already installed):
+# everything here is either a debugging tool or a hard dependency of a later
+# task file in this role.
+
+- name: Install utility and dependency packages
+  ansible.builtin.apt:
+    name: "{{ proxmox_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  register: proxmox_packages_installed
+  retries: 3
+  delay: 5
+  until: proxmox_packages_installed is succeeded
+
+################################################################################
+# ifupdown2 — required, not optional
+################################################################################
+# Proxmox writes network configuration to /etc/network/interfaces (Debian's
+# classic ifupdown format), NOT to NetworkManager like the Raspberry Pi router
+# does. The stock `ifupdown` implementation cannot re-read that file on a
+# running system: changing a bridge means a reboot.
+#
+# ifupdown2 adds `ifreload -a`, which applies the difference between the running
+# configuration and the file atomically, and `ifreload --syntax-check`, which
+# validates the file WITHOUT applying it. On a headless node in a cupboard that
+# distinction is the difference between a two-second reload and a physical trip
+# with a monitor and keyboard.
+- name: Ensure ifupdown2 is installed (required for live network reloads)
+  ansible.builtin.apt:
+    name: ifupdown2
+    state: present
+  when: proxmox_require_ifupdown2
+
+- name: Verify ifreload is available
+  ansible.builtin.command:
+    cmd: which ifreload
+  register: proxmox_ifreload_check
+  changed_when: false
+  failed_when: proxmox_ifreload_check.rc != 0
+  when: proxmox_require_ifupdown2
+
+################################################################################
+# Time synchronisation
+################################################################################
+# Clock drift breaks two things silently and confusingly: corosync (cluster
+# membership) and TLS certificate validation (the API Terraform talks to).
+# Chrony is installed above; here it is simply made sure it is actually running.
+- name: Ensure chrony is enabled and running
+  ansible.builtin.systemd:
+    name: chrony
+    state: started
+    enabled: true
+  failed_when: false

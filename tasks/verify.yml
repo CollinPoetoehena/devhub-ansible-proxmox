@@ -1,0 +1,278 @@
+---
+# verify.yml — Post-configuration checks.
+# 
+# Summary must run last.
+#
+# Everything here is READ-ONLY: changed_when: false everywhere, no task may
+# modify the node. `--tags verify` is safe to run at any time, including
+# against a production-ish node mid-incident.
+# 
+# Multiple verification tasks are executed all in this one file; simplifies the 
+# verification process and maintenance. The number of tasks are relatively small 
+# and manageable, so one file is fine. Even though it is long, it remains readable
+# and in this case it is better to keep it in one file for maintenance and readability.
+
+################################################################################
+# VERIFY NETWORKING — bridge, VLAN interface, addressing, forwarding
+################################################################################
+- name: "VERIFY NETWORKING | Check that the bridge exists"
+  ansible.builtin.command:
+    cmd: "ip -br link show {{ proxmox_bridge_name }}"
+  register: verify_bridge
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY NETWORKING | Check that the bridge is VLAN aware"
+  ansible.builtin.shell:
+    cmd: "cat /sys/class/net/{{ proxmox_bridge_name }}/bridge/vlan_filtering"
+  register: verify_bridge_vlan_filtering
+  changed_when: false
+  failed_when: false
+  # vlan_filtering=1 is the kernel's view of `bridge-vlan-aware yes`. Checking
+  # the kernel rather than the config file is the point: it proves the setting
+  # was actually APPLIED, not merely written.
+
+- name: "VERIFY NETWORKING | Check the VLANs the bridge accepts"
+  ansible.builtin.command:
+    cmd: "bridge vlan show dev {{ proxmox_physical_interface }}"
+  register: verify_bridge_vlans
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY NETWORKING | Check the management interface addresses (IPv4 + IPv6)"
+  ansible.builtin.command:
+    cmd: "ip -br addr show {{ proxmox_mgmt_interface }}"
+  register: verify_mgmt_addr
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY NETWORKING | Check the IPv4 default route"
+  ansible.builtin.command:
+    cmd: "ip -4 route show default"
+  register: verify_route4
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY NETWORKING | Check the IPv6 default route (proves the RA from the router was accepted)"
+  ansible.builtin.command:
+    cmd: "ip -6 route show default"
+  register: verify_route6
+  changed_when: false
+  failed_when: false
+  # An empty result here with a present IPv6 address is the classic
+  # accept_ra=1-on-a-forwarding-host symptom. See networking.yml.
+
+- name: "VERIFY NETWORKING | Check accept_ra on the management interface"
+  ansible.builtin.command:
+    cmd: "sysctl -n net.ipv6.conf.{{ proxmox_mgmt_interface | replace('.', '/') }}.accept_ra"
+  register: verify_accept_ra
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY NETWORKING | Inspect the Router Advertisement being sent by the lab router"
+  ansible.builtin.command:
+    cmd: "rdisc6 -1 -w 2000 {{ proxmox_mgmt_interface }}"
+  register: verify_rdisc6
+  changed_when: false
+  failed_when: false
+  when: proxmox_enable_ipv6
+
+################################################################################
+# VERIFY SERVICES — the Proxmox daemons and storage
+################################################################################
+- name: "VERIFY SERVICES | Check the state of the core Proxmox services"
+  ansible.builtin.command:
+    cmd: "systemctl is-active {{ item }}"
+  loop:
+    - pve-cluster      # owns /etc/pve — nothing works if this is down
+    - pvedaemon        # the API worker
+    - pveproxy         # the HTTPS endpoint Terraform talks to (8006)
+    - pvestatd         # collects the status shown in the UI and via the API
+    - chrony           # time sync (corosync and TLS both need it)
+  register: verify_services
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY SERVICES | Check that the API is answering locally"
+  ansible.builtin.command:
+    cmd: "pvesh get /version --output-format json"
+  register: verify_api
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY SERVICES | Check storage status"
+  ansible.builtin.command:
+    cmd: "pvesm status"
+  register: verify_storage
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY SERVICES | Check that the snippets content type is enabled"
+  ansible.builtin.shell:
+    cmd: "set -o pipefail; grep -A 10 '^dir: {{ proxmox_snippets_storage }}$' /etc/pve/storage.cfg | grep -m1 content || true"
+    executable: /bin/bash
+  register: verify_snippets
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY SERVICES | List VM templates"
+  ansible.builtin.shell:
+    cmd: "set -o pipefail; qm list | awk 'NR==1 || $1 >= 9000'"
+    executable: /bin/bash
+  register: verify_templates
+  changed_when: false
+  failed_when: false
+
+################################################################################
+# VERIFY AUTOMATION — does the Terraform identity actually exist and work?
+################################################################################
+- name: "VERIFY AUTOMATION | Check that the automation role exists with its privileges"
+  ansible.builtin.command:
+    cmd: "pveum role list --output-format json"
+  register: verify_roles
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY AUTOMATION | Check that the automation user exists"
+  ansible.builtin.command:
+    cmd: "pveum user list --output-format json"
+  register: verify_users
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY AUTOMATION | Check that the API token exists"
+  ansible.builtin.command:
+    cmd: "pveum user token list {{ proxmox_automation_user }} --output-format json"
+  register: verify_tokens
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY AUTOMATION | Check the ACL entries"
+  ansible.builtin.command:
+    cmd: "pveum acl list --output-format json"
+  register: verify_acl
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY AUTOMATION | Check the effective permissions of the API token"
+  ansible.builtin.command:
+    cmd: "pveum user permissions '{{ proxmox_automation_user }}' --token {{ proxmox_automation_token_id }} --output-format json"
+  register: verify_token_perms
+  changed_when: false
+  failed_when: false
+  # This is THE check that catches the most common automation failure: a token
+  # created with privsep=1 but never given its own ACL entry has zero
+  # permissions, and every Terraform call returns 403 despite the user having
+  # full rights.
+
+- name: "VERIFY AUTOMATION | Check the automation SSH account and its sudo rights"
+  ansible.builtin.command:
+    cmd: "sudo -l -U {{ proxmox_automation_ssh_user }}"
+  register: verify_automation_sudo
+  changed_when: false
+  failed_when: false
+  when: proxmox_automation_ssh_enabled
+
+################################################################################
+# VERIFY CONNECTIVITY — can this node reach the router, the internet and DNS,
+# over BOTH address families?
+################################################################################
+- name: "VERIFY CONNECTIVITY | Ping the lab router over IPv4"
+  ansible.builtin.command:
+    cmd: "ping -c 2 -W 2 {{ proxmox_mgmt_gateway }}"
+  register: verify_ping_gw4
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY CONNECTIVITY | Ping the lab router over IPv6"
+  ansible.builtin.command:
+    cmd: "ping -6 -c 2 -W 2 fd42:{{ proxmox_mgmt_vlan_id }}::1"
+  register: verify_ping_gw6
+  changed_when: false
+  failed_when: false
+  when: proxmox_enable_ipv6
+  # fd42:<vlan>::1 is the router's per-VLAN ULA gateway address, by the
+  # addressing convention in the network design.
+
+- name: "VERIFY CONNECTIVITY | Resolve a lab hostname via the router's dnsmasq"
+  ansible.builtin.command:
+    cmd: "dig +short +time=2 +tries=1 @{{ proxmox_mgmt_gateway }} {{ proxmox_node_name }}.{{ proxmox_domain }}"
+  register: verify_dns_local
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY CONNECTIVITY | Resolve an internet hostname (IPv4 + IPv6 records)"
+  ansible.builtin.command:
+    cmd: "dig +short +time=2 +tries=1 {{ item }} {{ proxmox_verify_internet_host }}"
+  loop: [A, AAAA]
+  register: verify_dns_internet
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY CONNECTIVITY | Reach the internet over IPv4 (through the router's NAT)"
+  ansible.builtin.command:
+    cmd: "ping -c 2 -W 3 1.1.1.1"
+  register: verify_internet4
+  changed_when: false
+  failed_when: false
+
+- name: "VERIFY CONNECTIVITY | Reach the internet over IPv6 (through the router's NAT66)"
+  ansible.builtin.command:
+    cmd: "ping -6 -c 2 -W 3 2606:4700:4700::1111"
+  register: verify_internet6
+  changed_when: false
+  failed_when: false
+  when: proxmox_enable_ipv6
+
+- name: "VERIFY CONNECTIVITY | Confirm the node CANNOT reach the home network (isolation must hold)"
+  ansible.builtin.command:
+    cmd: "ping -c 1 -W 2 {{ router_home_gateway | default('192.168.2.254') }}"
+  register: verify_home_blocked
+  changed_when: false
+  failed_when: false
+  # A SUCCESSFUL ping here is a FAILURE of the design: the router's
+  # "block lab -> home" rule should make this unreachable. Reported as such in
+  # the summary.
+
+################################################################################
+# PRINT SUMMARY — one readable block instead of scrolling back through
+# twenty registered variables. Mirrors the router role's verify summary.
+################################################################################
+- name: "VERIFY SUMMARY | Display the verification summary"
+  ansible.builtin.debug:
+    msg:
+      - "=================== PROXMOX NODE: {{ proxmox_node_name }} ==================="
+      - "Version          : {{ proxmox_version | default('unknown') }} on Debian {{ ansible_distribution_release }}"
+      - "FQDN             : {{ proxmox_node_name }}.{{ proxmox_domain }}"
+      - ""
+      - "----------------------- NETWORKING -----------------------"
+      - "Bridge           : {{ proxmox_bridge_name }} ({{ 'present' if verify_bridge.rc == 0 else 'MISSING' }})"
+      - "VLAN aware       : {{ 'yes' if (verify_bridge_vlan_filtering.stdout | default('0') | trim) == '1' else 'NO - VM VLAN tags will NOT work' }}"
+      - "Mgmt interface   : {{ verify_mgmt_addr.stdout | default('n/a') }}"
+      - "IPv4 default rt  : {{ verify_route4.stdout | default('') | trim | default('MISSING', true) }}"
+      - "IPv6 default rt  : {{ verify_route6.stdout | default('') | trim | default('MISSING (check accept_ra=2)', true) }}"
+      - "accept_ra        : {{ verify_accept_ra.stdout | default('?') }} (must be 2 on a forwarding host)"
+      - ""
+      - "----------------------- SERVICES -------------------------"
+      - "{{ verify_services.results | default([]) | map(attribute='item') | zip(verify_services.results | default([]) | map(attribute='stdout')) | map('join', ': ') | list }}"
+      - "API (pvesh)      : {{ 'responding' if verify_api.rc == 0 else 'NOT RESPONDING' }}"
+      - "Snippets enabled : {{ 'yes' if 'snippets' in (verify_snippets.stdout | default('')) else 'NO - cloud-init user-data uploads will fail' }}"
+      - ""
+      - "----------------------- TEMPLATES ------------------------"
+      - "{{ verify_templates.stdout_lines | default(['none']) }}"
+      - ""
+      - "--------------------- AUTOMATION -------------------------"
+      - "Role             : {{ proxmox_automation_role }} ({{ 'present' if proxmox_automation_role in (verify_roles.stdout | default('[]') | from_json | map(attribute='roleid') | list) else 'MISSING' }})"
+      - "User             : {{ proxmox_automation_user }} ({{ 'present' if proxmox_automation_user in (verify_users.stdout | default('[]') | from_json | map(attribute='userid') | list) else 'MISSING' }})"
+      - "API token        : {{ proxmox_automation_user }}!{{ proxmox_automation_token_id }} ({{ 'present' if proxmox_automation_token_id in (verify_tokens.stdout | default('[]') | from_json | map(attribute='tokenid') | list) else 'MISSING' }})"
+      - "Token permissions: {{ 'granted' if (verify_token_perms.stdout | default('{}') | length) > 5 else 'EMPTY - the token has an ACL problem (privsep without its own ACL entry)' }}"
+      - "SSH account      : {{ proxmox_automation_ssh_user }} ({{ 'sudo configured' if 'NOPASSWD' in (verify_automation_sudo.stdout | default('')) else 'no restricted sudo found' }})"
+      - ""
+      - "--------------------- CONNECTIVITY -----------------------"
+      - "Router IPv4      : {{ 'OK' if verify_ping_gw4.rc == 0 else 'FAILED' }}"
+      - "Router IPv6      : {{ ('OK' if verify_ping_gw6.rc == 0 else 'FAILED') if proxmox_enable_ipv6 else 'skipped (IPv6 disabled)' }}"
+      - "Lab DNS          : {{ verify_dns_local.stdout | default('') | trim | default('NO ANSWER', true) }}"
+      - "Internet IPv4    : {{ 'OK' if verify_internet4.rc == 0 else 'FAILED' }}"
+      - "Internet IPv6    : {{ ('OK (NAT66 working)' if verify_internet6.rc == 0 else 'FAILED') if proxmox_enable_ipv6 else 'skipped' }}"
+      - "Home net blocked : {{ 'OK - unreachable as designed' if verify_home_blocked.rc != 0 else 'PROBLEM: the home network is REACHABLE from the lab' }}"
+      - "=========================================================="

@@ -1,0 +1,97 @@
+---
+# hardening.yml — SSH and the node-level (Proxmox) firewall.
+#
+################################################################################
+# Why a node firewall when the router already filters everything
+################################################################################
+# The router's nftables ruleset only sees traffic that CROSSES the router. Two
+# VMs on VLAN 20 running on this same node talk to each other through vmbr0 and
+# never leave the hypervisor — the router cannot see, let alone filter, that
+# path. The Proxmox firewall is the only control point for it.
+#
+# This is defence in depth, not duplication:
+#   router nftables   -> between VLANs, lab <-> home, lab <-> internet
+#   pve-firewall      -> into the node itself, and between VMs on the same host
+
+################################################################################
+# SSH hardening
+################################################################################
+- name: Harden the SSH daemon
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/99-homelab-hardening.conf
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      # {{ ansible_managed }}
+      #
+      # Written to sshd_config.d/ rather than editing sshd_config directly:
+      # the main file is package-managed and would prompt on every upgrade.
+      #
+      # PermitRootLogin {{ proxmox_ssh_permit_root_login }}
+      #   "prohibit-password" allows root by KEY only. Root over SSH is kept
+      #   available (unlike on a normal server) because it is the documented
+      #   recovery path for a Proxmox node and because `pvecm add` needs it.
+      PermitRootLogin {{ proxmox_ssh_permit_root_login }}
+
+      # Password authentication off: the lab uses keys exclusively
+      # (e.g. ~/.ssh/id_homelab). This also removes the entire brute-force surface.
+      PasswordAuthentication {{ 'yes' if proxmox_ssh_password_authentication else 'no' }}
+      KbdInteractiveAuthentication {{ 'yes' if proxmox_ssh_password_authentication else 'no' }}
+      PubkeyAuthentication yes
+
+      # No empty passwords, ever.
+      PermitEmptyPasswords no
+
+      # Drop idle sessions: 5 minutes of silence, 3 probes.
+      ClientAliveInterval 300
+      ClientAliveCountMax 3
+    validate: "sshd -t -f %s"
+  when: proxmox_harden_ssh
+  notify: Restart sshd
+  # validate with `sshd -t`: an invalid sshd config means the daemon refuses to
+  # restart, and on a headless node that is a lockout.
+
+################################################################################
+# Proxmox firewall
+################################################################################
+# Layout of the Proxmox firewall configuration:
+#   /etc/pve/firewall/cluster.fw   cluster-wide rules + the master enable switch
+#   /etc/pve/nodes/<node>/host.fw  rules for the node itself
+#   /etc/pve/firewall/<vmid>.fw    per-VM rules (Terraform can manage these)
+#
+# The master switch in cluster.fw is what actually turns filtering on. A
+# host.fw with a DROP policy does nothing while the cluster switch is off —
+# which is a good safety property, but also a very confusing one when you
+# expect to be blocked and are not.
+- name: Ensure the firewall configuration directory exists
+  ansible.builtin.file:
+    path: /etc/pve/firewall
+    state: directory
+    mode: "0755"
+  when: proxmox_enable_firewall
+
+- name: Deploy the cluster-level firewall configuration
+  ansible.builtin.template:
+    src: cluster.fw.j2
+    dest: /etc/pve/firewall/cluster.fw
+    mode: "0640"
+    backup: true
+  when: proxmox_enable_firewall
+  notify: Reload pve-firewall
+
+- name: Deploy the node-level firewall configuration
+  ansible.builtin.template:
+    src: host.fw.j2
+    dest: "/etc/pve/nodes/{{ proxmox_node_name }}/host.fw"
+    mode: "0640"
+    backup: true
+  when: proxmox_enable_firewall
+  notify: Reload pve-firewall
+
+- name: Ensure the firewall service is enabled and running
+  ansible.builtin.systemd:
+    name: pve-firewall
+    state: started
+    enabled: true
+  when: proxmox_enable_firewall

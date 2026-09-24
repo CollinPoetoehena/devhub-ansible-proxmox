@@ -5,19 +5,354 @@
 # MUST be set in group_vars/proxmox/ or host_vars/.
 
 ################################################################################
-# Network Interfaces
+# Identity / cluster
 ################################################################################
-# The physical network interface on the Proxmox host. This is the NIC that will be attached to the main bridge (vmbr0).
-# Check with `ip link` or `ls /sys/class/net/` to find the correct interface name on the Proxmox host.
-pve_physical_interface: "nic0"
+# Hostname the node should carry. Defaults to the inventory name so a node is
+# named exactly as it is addressed by Ansible (pve1, pve2, ...).
+proxmox_node_name: "{{ inventory_hostname }}"
+
+# Search domain of the lab, must match router_dhcp_domain on the router so that
+# `ping pve1` resolves. Used for /etc/hosts and the FQDN.
+proxmox_domain: "lab.local"
+
+# Proxmox refuses to start pve-cluster if /etc/hosts does not contain a line
+# mapping the node's FQDN to its *management* IP. Getting this wrong is the
+# single most common reason a fresh install boots into a broken web UI.
+proxmox_manage_etc_hosts: true
+
+# --- Clustering -------------------------------------------------------------
+# A single node is a perfectly valid Proxmox "cluster of one". Clustering is
+# only enabled once a SECOND node exists, because a two-node cluster without a
+# QDevice has no quorum when one node is down — which in a homelab (where one
+# node is often powered off) means the remaining node refuses to start VMs.
+#
+#   proxmox_cluster_enabled: false  -> standalone node (default, correct for PVE1 today)
+#   proxmox_cluster_enabled: true   -> create the cluster on the primary node and
+#                                      join every other node to it
+proxmox_cluster_enabled: false
+proxmox_cluster_name: "homelab"
+# Which inventory host creates the cluster; all others join it.
+proxmox_cluster_primary: "{{ groups['proxmox'] | first }}"
+# Link0 address used for corosync traffic. Management VLAN by design: it is the
+# only VLAN that is allowed to reach every node and the router (see the router
+# role's per-VLAN firewall policy).
+proxmox_cluster_link_address: "{{ proxmox_mgmt_ipv4 | default(omit) }}"
 
 ################################################################################
-# LAN Network Configuration (Lab Network)
-# --- REQUIRED: override in group_vars/proxmox/ ---
+# Repositories
 ################################################################################
-# Static IP of the Proxmox management interface (vmbr0.10)
-# pve_mgmt_ip: 10.42.10.10
-# Netmask of the Proxmox management interface (vmbr0.10)
-# pve_mgmt_netmask: 255.255.255.0
-# Gateway of the Proxmox management interface (vmbr0.10)
-# pve_mgmt_gateway: 10.42.10.1
+# A stock Proxmox install enables the ENTERPRISE repository, which requires a
+# paid subscription. Without a subscription `apt update` fails with a 401 and
+# the node never receives updates — so the enterprise repo is disabled and the
+# free "no-subscription" repo is enabled instead.
+#
+# no-subscription is the right choice for a homelab: same packages, slightly
+# less testing, no cost. Never use it under a support contract.
+proxmox_use_no_subscription_repo: true
+proxmox_disable_enterprise_repo: true
+proxmox_enable_ceph_repo: false
+
+# Debian suite the PVE release is based on. PVE 8 -> bookworm, PVE 9 -> trixie.
+# Auto-detected from the host's own facts so the same role works on both.
+proxmox_debian_suite: "{{ ansible_distribution_release }}"
+
+# Modern Proxmox/Debian ship deb822-style *.sources files instead of one-line
+# entries in sources.list. Set to false for PVE <= 8.1 style one-liners.
+proxmox_use_deb822_sources: true
+
+# Remove the "You do not have a valid subscription" popup in the web UI.
+# Purely cosmetic and re-applied after every proxmox-widget-toolkit upgrade,
+# which is why it is a managed task rather than a one-off manual patch.
+proxmox_remove_subscription_nag: true
+
+# Run a full `apt dist-upgrade` when the role runs. Safe on a lab node, and it
+# is how the node picks up the no-subscription packages after the repo switch.
+proxmox_perform_dist_upgrade: true
+
+################################################################################
+# Packages
+################################################################################
+# Tooling that makes a node debuggable and that Terraform/cloud-init depend on.
+proxmox_packages:
+  - vim                 # editor
+  - git                 # pulling config/scripts onto the node
+  - curl                # HTTP testing (curl -6 to force IPv6)
+  - wget                # downloading cloud images for the VM templates
+  - jq                  # parsing `pvesh ... --output-format json` in scripts
+  - tcpdump             # packet capture (VLAN tags, DHCP, RA debugging)
+  - dnsutils            # dig/nslookup, including AAAA lookups
+  - iputils-ping        # ping / ping -6
+  - ndisc6              # rdisc6 — inspect the router's Router Advertisements
+  - ifupdown2           # apply /etc/network/interfaces changes WITHOUT a reboot
+  - libguestfs-tools    # virt-customize — inject qemu-guest-agent into images
+  - cloud-init          # cloud-init CLI on the host (image inspection)
+  - chrony              # time sync; corosync and TLS both hate clock drift
+  - htop                # quick resource inspection
+  - lm-sensors          # temperatures — this node is a laptop in a cupboard
+  - zip                 # occasional log/config bundling
+
+# ifupdown2 is REQUIRED, not optional: the stock ifupdown cannot reload
+# /etc/network/interfaces live, so every bridge/VLAN change would need a reboot
+# and any mistake would lock you out of a headless node.
+proxmox_require_ifupdown2: true
+
+################################################################################
+# Networking — VLAN-aware bridge + tagged management interface
+# --- REQUIRED per node: set proxmox_mgmt_ipv4 in host_vars ---
+################################################################################
+# Physical NIC facing the lab switch. On the Acer laptop this is the built-in
+# Ethernet port; `ip -br link` on the node tells you the name (enp2s0, eno1, ...).
+proxmox_physical_interface: "eno1"
+
+# Name of the Linux bridge VMs attach to. vmbr0 is the Proxmox convention.
+proxmox_bridge_name: "vmbr0"
+
+# THE key setting for this lab: a VLAN-AWARE bridge. Without it, each VLAN would
+# need its own bridge (vmbr0.10, vmbr0.20, ...) and every VM would be pinned to
+# one of them. With bridge-vlan-aware yes, a VM is placed into a VLAN simply by
+# setting a tag on its NIC — which is exactly what the Terraform module does via
+# `vlan_id`. Switch port 2/3 is already a trunk carrying tagged 10/20/30
+# (see Network Design -> Switch Port Assignments), so the bridge must understand
+# those tags rather than strip them.
+proxmox_bridge_vlan_aware: true
+
+# VLAN IDs the bridge accepts. Must be a superset of the VLANs used by VMs.
+# Matches router_vlans on the lab router (10 Management, 20 Services, 30 IoT).
+proxmox_bridge_vlan_ids: "2-4094"
+
+# Management VLAN — the node's own IP lives here, tagged, on vmbr0.10.
+# The native VLAN (1) is deliberately unused for production traffic in this lab,
+# so the node gets NO address on the untagged bridge itself.
+proxmox_mgmt_vlan_id: 10
+proxmox_mgmt_interface: "{{ proxmox_bridge_name }}.{{ proxmox_mgmt_vlan_id }}"
+
+# --- REQUIRED per node (host_vars/pve1.yml) --------------------------------
+#   proxmox_mgmt_ipv4:      "10.42.10.10"
+#   proxmox_mgmt_ipv4_cidr: 24
+# proxmox_mgmt_ipv4:
+proxmox_mgmt_ipv4_cidr: 24
+proxmox_mgmt_gateway: "10.42.10.1"          # the Pi router's VLAN 10 address
+
+# --- IPv6 -------------------------------------------------------------------
+# The node takes its IPv6 address via SLAAC from the router's Router
+# Advertisements (dnsmasq `enable-ra` + `ra-names`), exactly like every other
+# lab device. WHY not a static ULA:
+#   - the router already publishes an AAAA record for the node's SLAAC address
+#     via ra-names, so DNS works without hard-coding anything;
+#   - hard-coding IPv6 literals is precisely the habit the lab is trying to
+#     avoid (see the dnsmasq template's note on static leases).
+# The management IPv4 stays static because Proxmox itself, corosync and the
+# certificate SANs all want a stable, predictable v4 address.
+proxmox_enable_ipv6: true
+proxmox_mgmt_ipv6_method: "auto"            # auto (SLAAC) | static | disabled
+# proxmox_mgmt_ipv6:                        # only used when method == static
+proxmox_mgmt_ipv6_cidr: 64
+
+# accept_ra must be forced to 2 on the management interface. A host that
+# forwards packets (which a hypervisor with a bridge does) ignores RAs by
+# default and would end up with an address but no IPv6 default route — the
+# same trap the router role documents for its WAN interface.
+proxmox_force_accept_ra: true
+
+# Back up /etc/network/interfaces before touching it, and validate with
+# `ifreload --syntax-check` before applying. A bad bridge definition on a
+# headless node means a physical trip to the laptop.
+proxmox_network_safe_apply: true
+
+################################################################################
+# Storage
+################################################################################
+# Directory used for cloud-init snippets (user-data / vendor-data files that
+# Terraform uploads). Proxmox will not accept a snippet unless the storage it
+# lives on has the `snippets` content type enabled — forgetting this is the
+# classic "cloud-init did nothing" failure.
+proxmox_snippets_storage: "local"
+proxmox_enable_snippets: true
+
+# Storage used for VM disks. "local-lvm" is the default LVM-thin pool created by
+# the installer. Override per node if the machine was partitioned differently.
+proxmox_vm_storage: "local-lvm"
+
+# Storage used for ISO images and cloud images.
+proxmox_iso_storage: "local"
+
+# Where downloaded cloud images are cached on the node before being imported.
+proxmox_image_cache_dir: "/var/lib/vz/template/cloud-images"
+
+################################################################################
+# VM templates (cloud-init golden images)
+################################################################################
+# Terraform clones these; it never installs an OS. Building the template here
+# (in Ansible, on the node) keeps Terraform purely declarative and fast:
+# cloning a prepared template takes seconds, an unattended install takes
+# minutes and is far more fragile.
+#
+# Each entry:
+#   vmid          - template VM id (use a dedicated high range, 9000+, so a
+#                   template is never confused with a real VM)
+#   name          - template name, referenced by the Terraform module
+#   url           - cloud image to download (.qcow2/.img with cloud-init inside)
+#   checksum      - "sha256:<hex>" or "sha512:<hex>"; omit to skip verification
+#   disk_size     - size the imported disk is resized to before templating
+#   cores/memory  - defaults baked into the template (clones override them)
+#   inject_agent  - run virt-customize to install qemu-guest-agent into the
+#                   image. Without the agent, Proxmox cannot read a VM's IP and
+#                   Terraform's `ipv4_addresses` output stays empty forever.
+proxmox_vm_templates:
+  - vmid: 9000
+    name: "debian-13-cloudinit"
+    url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+    disk_size: "20G"
+    cores: 2
+    memory: 2048
+    inject_agent: true
+  - vmid: 9001
+    name: "ubuntu-2404-cloudinit"
+    url: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+    disk_size: "20G"
+    cores: 2
+    memory: 2048
+    inject_agent: true
+
+# Building templates downloads several hundred MB, so it is behind its own tag
+# (`--tags templates`) and off by default on re-runs: existing templates are
+# never rebuilt unless proxmox_force_rebuild_templates is set.
+proxmox_build_templates: true
+proxmox_force_rebuild_templates: false
+
+################################################################################
+# Automation account (the account Terraform authenticates as)
+################################################################################
+# WHY a dedicated account instead of root@pam:
+#   1. Least privilege — Terraform needs to create/destroy VMs, not to reinstall
+#      the node, change the cluster or read every other user's credentials.
+#   2. Revocable — an API token can be deleted without touching any human login.
+#   3. Auditable — every action in the task log carries the token's name, so
+#      "who deleted VM 120" has an answer.
+#   4. Non-interactive — a token has no password, no 2FA and no TTY, which is
+#      exactly what CI/Terraform needs.
+#
+# The account is created in the PVE realm (@pve), Proxmox's own user database.
+# WHY @pve and not @pam: a @pam user is a real Linux account on the node and
+# would have to exist (and be kept in sync) on every node in the cluster; a @pve
+# user is cluster-wide configuration replicated automatically.
+proxmox_automation_user: "terraform@pve"
+proxmox_automation_token_id: "automation"        # full token: terraform@pve!automation
+proxmox_automation_role: "TerraformProv"
+proxmox_automation_group: "automation"
+
+# Privileges granted to the custom role. This is the minimum set that lets
+# Terraform (bpg/proxmox provider) clone a template, configure cloud-init,
+# attach disks/NICs, start/stop and destroy a VM — and nothing else.
+#
+# Deliberately NOT included: Sys.PowerMgmt (rebooting the hypervisor),
+# Realm.Allocate (creating users), Permissions.Modify (privilege escalation),
+# Sys.Modify on / (changing the node's own network).
+proxmox_automation_privileges:
+  - VM.Allocate
+  - VM.Clone
+  - VM.Config.CDROM
+  - VM.Config.CPU
+  - VM.Config.Cloudinit
+  - VM.Config.Disk
+  - VM.Config.HWType
+  - VM.Config.Memory
+  - VM.Config.Network
+  - VM.Config.Options
+  - VM.Console
+  - VM.Migrate
+  - VM.Monitor
+  - VM.PowerMgmt
+  - VM.Audit
+  - Datastore.Allocate
+  - Datastore.AllocateSpace
+  - Datastore.AllocateTemplate
+  - Datastore.Audit
+  - Sys.Audit
+  - Sys.Console
+  - Pool.Allocate
+  - Pool.Audit
+  - SDN.Use
+
+# Where the role is granted. "/" with propagate is required because Terraform
+# allocates NEW VM ids (which have no ACL path of their own yet) and reads node
+# and storage status. Scope is limited by the ROLE, not by the path.
+proxmox_automation_acl_path: "/"
+proxmox_automation_acl_propagate: true
+
+# Privilege separation on the API token.
+#   true  (privsep=1) -> the token needs its OWN ACL entry, and can never have
+#                        more rights than the user. Safest, and what is used.
+#   false (privsep=0) -> the token inherits every permission of the user.
+proxmox_automation_token_privsep: true
+
+# Token secrets are shown exactly ONCE by Proxmox, at creation time. The role
+# captures that value and writes it to this file on the Ansible controller so it
+# can be fed into Terraform (via TF_VAR_/environment) without ever being typed
+# by hand or pasted into a chat window.
+#
+# SECURITY: this file is a credential. It is written 0600 and the path must be
+# in .gitignore. Rotate by deleting the token in the UI and re-running with
+# --tags automation -e proxmox_rotate_automation_token=true.
+proxmox_automation_token_output: "{{ playbook_dir }}/.secrets/{{ proxmox_node_name }}-terraform-token.env"
+proxmox_write_automation_token_file: true
+proxmox_rotate_automation_token: false
+
+# --- Optional: a matching SSH system account -------------------------------
+# The bpg/proxmox provider needs SSH to the node for a few operations the API
+# does not expose (notably uploading cloud-init snippets to a directory
+# storage, and importing disk images). Those run as a system user, not an API
+# token, which is why this second account exists.
+proxmox_automation_ssh_user: "terraform"
+proxmox_automation_ssh_enabled: true
+# Public keys allowed to log in as that user. Use the SAME key you already use
+# for the lab (~/.ssh/id_homelab.pub) unless you want a separate CI key.
+proxmox_automation_ssh_keys: []
+# The account gets passwordless sudo restricted to the handful of binaries the
+# provider actually calls. Full NOPASSWD:ALL would make the "least privilege"
+# API token pointless, since the same automation could then do anything as root.
+proxmox_automation_sudo_commands:
+  - /sbin/pvesm
+  - /sbin/qm
+  - /usr/bin/tee /var/lib/vz/snippets/*
+  - /usr/sbin/qm
+  - /usr/sbin/pvesm
+
+################################################################################
+# Hardening
+################################################################################
+# Disable password authentication and root SSH login. Access to the node is by
+# key only, and only from the management VLAN (the router's firewall already
+# blocks VLAN 20/30 -> VLAN 10, this is defence in depth on the host itself).
+proxmox_harden_ssh: true
+proxmox_ssh_permit_root_login: "prohibit-password"
+proxmox_ssh_password_authentication: false
+
+# Proxmox has its own cluster firewall (pve-firewall), which is separate from
+# and additional to the router's nftables ruleset. It is enabled here in
+# default-deny mode with explicit allows for the management VLAN only.
+#
+# WHY a second firewall when the router already filters: the router only sees
+# traffic that CROSSES it. Two VMs on VLAN 20 on the SAME node talk to each
+# other through vmbr0 and never touch the router at all. The node-level
+# firewall is the only thing that can filter that path.
+proxmox_enable_firewall: true
+proxmox_firewall_management_sources:
+  - "10.42.10.0/24"
+proxmox_firewall_allowed_tcp_ports:
+  - 22      # SSH
+  - 8006    # Proxmox web UI / API
+  - 3128    # SPICE proxy (console access from the web UI)
+# Corosync ports, only opened when clustering is enabled.
+proxmox_firewall_cluster_udp_ports:
+  - 5405
+  - 5406
+
+################################################################################
+# Verification
+################################################################################
+# Run the post-configuration checks at the end of a normal run. Set to false for
+# a faster run when iterating; `--tags verify` always runs them on demand.
+proxmox_run_verification: true
+# Hostname used for the outbound connectivity check from the node.
+proxmox_verify_internet_host: "deb.debian.org"

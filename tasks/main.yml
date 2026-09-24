@@ -1,5 +1,63 @@
 ---
 # tasks file for devhub-ansible-proxmox
+#
+# Orchestration only: every concern lives in its own task file so that a single
+# tag (`--tags network`, `--tags automation`, ...) is self-contained and can be
+# run on its own against a node that is already configured.
+#
+# ORDER MATTERS and is not arbitrary:
+#   preflight   -> refuse to run against a machine that is not Proxmox at all
+#   repositories-> fix apt BEFORE anything tries to install a package
+#   packages    -> ifupdown2 must exist before networking reloads the config
+#   networking  -> the node must be reachable on VLAN 10 before storage/cluster
+#   storage     -> snippets must exist before a template or Terraform uses them
+#   cluster     -> only meaningful once the network is correct
+#   templates   -> needs storage + internet (downloads cloud images)
+#   automation  -> the account Terraform uses; last because it is the handover
+#                  point between "Ansible owns the host" and "Terraform owns
+#                  the VMs on it"
+#   hardening   -> locks SSH/firewall down AFTER everything that needed access
+#   verify      -> read-only checks + a printed summary
 
-# TODO: create the tasks and run it against my laptop, etc.
-# TODO: the template has the network interfaces setup that did work before, but change this to use Ansible tasks, etc.
+- name: Preflight checks
+  ansible.builtin.import_tasks: preflight.yml
+  tags: [always]
+
+- name: Configure APT repositories
+  ansible.builtin.import_tasks: repositories.yml
+  tags: [proxmox, repositories, apt]
+
+- name: Install packages
+  ansible.builtin.import_tasks: packages.yml
+  tags: [proxmox, packages]
+
+- name: Configure networking (VLAN-aware bridge + management VLAN)
+  ansible.builtin.import_tasks: networking.yml
+  tags: [proxmox, network, networking]
+
+- name: Configure storage
+  ansible.builtin.import_tasks: storage.yml
+  tags: [proxmox, storage]
+
+- name: Configure clustering
+  ansible.builtin.import_tasks: cluster.yml
+  when: proxmox_cluster_enabled
+  tags: [proxmox, cluster]
+
+- name: Build cloud-init VM templates
+  ansible.builtin.import_tasks: templates.yml
+  when: proxmox_build_templates
+  tags: [proxmox, templates]
+
+- name: Configure the automation account (Terraform)
+  ansible.builtin.import_tasks: automation.yml
+  tags: [proxmox, automation, terraform]
+
+- name: Harden the node
+  ansible.builtin.import_tasks: hardening.yml
+  tags: [proxmox, hardening, security]
+
+- name: Verify the configuration
+  ansible.builtin.import_tasks: verify.yml
+  when: proxmox_run_verification
+  tags: [proxmox, verify]

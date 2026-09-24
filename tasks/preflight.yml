@@ -1,0 +1,98 @@
+---
+# preflight.yml — Refuse to run against the wrong machine, and fail early with a
+# readable message instead of a confusing error twenty tasks later.
+#
+# WHY this file exists: this role reconfigures /etc/network/interfaces and the
+# APT sources of whatever host it is pointed at. Running it accidentally against
+# the Raspberry Pi router (also Debian, also reachable as ansibleremote) would
+# destroy the lab network. The check below makes that impossible.
+
+- name: Gather facts
+  ansible.builtin.setup:
+  when: ansible_facts == {}
+
+################################################################################
+# Is this actually a Proxmox VE node?
+################################################################################
+- name: Check for the Proxmox VE marker (pveversion)
+  ansible.builtin.stat:
+    path: /usr/bin/pveversion
+  register: proxmox_pveversion_binary
+
+- name: Fail if this host is not a Proxmox VE node
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} does not look like a Proxmox VE node
+      (/usr/bin/pveversion is missing). This role must only be run against a
+      machine that was installed from the Proxmox VE ISO — installing PVE is
+      the one manual step, see the role README.
+  when: not proxmox_pveversion_binary.stat.exists
+
+- name: Read the Proxmox VE version
+  ansible.builtin.command:
+    cmd: pveversion
+  register: proxmox_version_raw
+  changed_when: false
+
+- name: Store the major version as a fact
+  ansible.builtin.set_fact:
+    # pveversion prints e.g. "pve-manager/9.0.3/abcdef (running kernel: 6.14.0-2-pve)"
+    proxmox_version: "{{ proxmox_version_raw.stdout | regex_search('pve-manager/([0-9]+\\.[0-9]+)', '\\1') | first }}"
+    proxmox_major_version: "{{ proxmox_version_raw.stdout | regex_search('pve-manager/([0-9]+)', '\\1') | first | int }}"
+
+- name: Show the detected Proxmox version
+  ansible.builtin.debug:
+    msg: "Detected Proxmox VE {{ proxmox_version }} on Debian {{ ansible_distribution_release }} ({{ ansible_architecture }})"
+
+################################################################################
+# Required variables
+################################################################################
+# These have no sensible generic default: a management IP is per-node by
+# definition. Asserting here turns "the node silently got no IP" into a clear
+# error before /etc/network/interfaces is touched.
+- name: Assert that the required per-node variables are set
+  ansible.builtin.assert:
+    that:
+      - proxmox_mgmt_ipv4 is defined
+      - proxmox_mgmt_ipv4 | ansible.utils.ipv4
+      - proxmox_physical_interface is defined
+      - proxmox_mgmt_vlan_id | int > 1
+    fail_msg: >-
+      Missing or invalid per-node configuration for {{ inventory_hostname }}.
+      Required in host_vars/{{ inventory_hostname }}.yml:
+        proxmox_mgmt_ipv4         (e.g. "10.42.10.10")
+        proxmox_physical_interface (e.g. "eno1" — check with `ip -br link`)
+      proxmox_mgmt_vlan_id must be a tagged VLAN (>1): the native VLAN carries
+      no production traffic in this lab by design.
+    quiet: true
+
+- name: Assert that the physical interface actually exists on this node
+  ansible.builtin.assert:
+    that:
+      - proxmox_physical_interface in ansible_interfaces
+    fail_msg: >-
+      Interface "{{ proxmox_physical_interface }}" does not exist on
+      {{ inventory_hostname }}. Interfaces found: {{ ansible_interfaces | join(', ') }}.
+      Set proxmox_physical_interface in host_vars to the NIC connected to the
+      lab switch.
+    quiet: true
+
+################################################################################
+# Carrier check
+################################################################################
+# Same trap as on the router's eth1 (see 2_Setup_Network.md, Step 5.2): a bridge
+# over a cable-less NIC comes up but forwards nothing, and the symptom ("the VM
+# gets no DHCP lease") points at everything except the cable.
+- name: Check that the lab-facing interface has carrier (cable plugged into the switch)
+  ansible.builtin.slurp:
+    src: "/sys/class/net/{{ proxmox_physical_interface }}/carrier"
+  register: proxmox_carrier
+  failed_when: false
+
+- name: Warn if the lab-facing interface has no carrier
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ proxmox_physical_interface }} reports NO CARRIER. The bridge
+      will be configured but no traffic can flow until the cable to the lab
+      switch is connected (switch port 2/3, trunk: tagged 10/20/30).
+  when: (proxmox_carrier.content | default('') | b64decode | trim) != '1'

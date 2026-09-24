@@ -1,0 +1,45 @@
+# {{ ansible_managed }}
+#
+# Cluster-wide Proxmox firewall configuration.
+# Managed by the `proxmox` Ansible role — do not edit in the web UI.
+#
+# FILE FORMAT: INI-like sections.
+#   [OPTIONS]  global switches
+#   [ALIASES]  named addresses/CIDRs, referenced as an alias in rules
+#   [IPSET x]  a named set of addresses, referenced as +x in rules
+#   [RULES]    the rules themselves
+#
+# The `enable: 1` below is the MASTER SWITCH. While it is 0, no host.fw or
+# VM-level rule has any effect at all, no matter what it says.
+
+[OPTIONS]
+
+enable: 1
+
+# Default policy for traffic INTO cluster members. DROP, matching the router's
+# nftables default-deny posture: nothing reaches a node unless a rule allows it.
+policy_in: DROP
+
+# Outbound from the nodes is allowed: they are trusted devices that need apt,
+# DNS and NTP. Same reasoning as the router's `policy accept` on its output
+# chain — filtering a machine's own egress is maintenance cost with little
+# practical gain in a lab.
+policy_out: ACCEPT
+
+[ALIASES]
+
+# Named CIDRs make the rules below readable and keep the addressing in one
+# place, exactly like `define` does in the router's nftables fragments.
+{% for src in proxmox_firewall_management_sources %}
+mgmt_net_{{ loop.index }} {{ src }}
+{% endfor %}
+
+[IPSET management]
+
+# The set of sources permitted to reach the management plane of any node.
+# VLAN 10 only: the router's firewall already drops VLAN 20/30 -> VLAN 10, and
+# this is the host-level restatement of that policy for the traffic the router
+# never sees.
+{% for src in proxmox_firewall_management_sources %}
+{{ src }}
+{% endfor %}

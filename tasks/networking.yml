@@ -1,0 +1,209 @@
+---
+# networking.yml — VLAN-aware bridge + tagged management interface.
+#
+################################################################################
+# What this configures and why it looks the way it does
+################################################################################
+# The lab switch delivers a TRUNK to this node's port: untagged VLAN 1 (unused)
+# plus tagged VLAN 10 (Management), 20 (Services) and 30 (IoT). See
+# "Switch Port Assignments" in the network design. The node must therefore:
+#
+#   1. Put the physical NIC into a VLAN-AWARE bridge (vmbr0). A VLAN-aware
+#      bridge passes 802.1Q tags through to VM NICs instead of stripping them,
+#      which is what makes "put this VM on VLAN 20" a one-line tag on the VM
+#      rather than a whole extra bridge per VLAN. The Terraform module sets
+#      exactly that tag via its `vlan_id` variable.
+#
+#   2. Give the NODE ITSELF an address on the tagged management VLAN only
+#      (vmbr0.10), never on the untagged bridge. The native VLAN carries no
+#      production traffic in this lab by design, so an address there would
+#      reintroduce exactly the ambiguity the design removes.
+#
+#   3. Take IPv6 via SLAAC from the router's Router Advertisements, and force
+#      accept_ra=2 because a host that forwards packets (any hypervisor with a
+#      bridge) ignores RAs by default and would end up with an address but no
+#      IPv6 default route. This is the same trap documented on the router's WAN
+#      interface.
+#
+# Proxmox uses /etc/network/interfaces (ifupdown2), NOT NetworkManager — that
+# is the main structural difference from the router role.
+#
+################################################################################
+# Safety model
+################################################################################
+# Reconfiguring the network of the host you are connected THROUGH is the most
+# dangerous thing this whole role does. The sequence below is deliberate:
+#   render to a temp file -> syntax-check it -> back up the live file ->
+#   install it -> ifreload -a (handler) -> verify reachability
+# If the syntax check fails, the live file is never touched.
+
+################################################################################
+# Hostname and /etc/hosts
+################################################################################
+# pve-cluster refuses to start if the node's FQDN does not resolve to its
+# management IP in /etc/hosts. The symptom is a node that boots but whose web
+# UI returns 595/connection errors, which is very hard to diagnose from the
+# other side of an SSH tunnel.
+- name: Set the node hostname
+  ansible.builtin.hostname:
+    name: "{{ proxmox_node_name }}"
+  when: ansible_hostname != proxmox_node_name
+  notify: Restart pve-cluster
+
+- name: Ensure /etc/hosts maps the FQDN to the management IP
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^\s*{{ proxmox_mgmt_ipv4 | regex_escape }}\s'
+    line: "{{ proxmox_mgmt_ipv4 }} {{ proxmox_node_name }}.{{ proxmox_domain }} {{ proxmox_node_name }}"
+    state: present
+    backup: true
+  when: proxmox_manage_etc_hosts
+  notify: Restart pve-cluster
+
+- name: Remove any 127.0.1.1 entry for this node (breaks pve-cluster)
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.1\.1\s+{{ proxmox_node_name | regex_escape }}'
+    state: absent
+  when: proxmox_manage_etc_hosts
+  # Debian's installer adds 127.0.1.1 <hostname>. On Proxmox that makes the
+  # node resolve its own name to loopback, so corosync advertises 127.0.1.1 to
+  # the cluster and the node can never form quorum with anyone.
+
+################################################################################
+# Render and validate /etc/network/interfaces
+################################################################################
+- name: Render the interfaces configuration to a staging file
+  ansible.builtin.template:
+    src: interfaces.j2
+    dest: /etc/network/interfaces.ansible-staged
+    owner: root
+    group: root
+    mode: "0640"
+    # No validate: here — ifupdown2's checker wants the file at a plausible
+    # path and we want to keep the artefact around for inspection if it fails.
+  register: proxmox_interfaces_staged
+  changed_when: false
+
+- name: Syntax-check the staged interfaces configuration (nothing is applied)
+  ansible.builtin.command:
+    cmd: "ifreload --syntax-check --interfaces /etc/network/interfaces.ansible-staged"
+  register: proxmox_interfaces_check
+  changed_when: false
+  failed_when: proxmox_interfaces_check.rc != 0
+  when: proxmox_network_safe_apply
+  # This is the network equivalent of the router role's `nft --check`: parse and
+  # validate the complete configuration WITHOUT touching the running system. If
+  # it fails, the play stops here and /etc/network/interfaces is still the
+  # last-known-good file.
+
+- name: Back up the current interfaces file
+  ansible.builtin.copy:
+    src: /etc/network/interfaces
+    dest: "/etc/network/interfaces.backup-{{ ansible_date_time.iso8601_basic_short }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0640"
+    force: false
+  when: proxmox_network_safe_apply
+  changed_when: false
+
+- name: Install the interfaces configuration
+  ansible.builtin.template:
+    src: interfaces.j2
+    dest: /etc/network/interfaces
+    owner: root
+    group: root
+    mode: "0640"
+    backup: true
+  register: proxmox_interfaces_installed
+  notify: Reload network configuration
+
+- name: Remove the staging file
+  ansible.builtin.file:
+    path: /etc/network/interfaces.ansible-staged
+    state: absent
+  changed_when: false
+
+################################################################################
+# IPv6 sysctls
+################################################################################
+# accept_ra semantics (net.ipv6.conf.<if>.accept_ra):
+#   0 = never accept Router Advertisements
+#   1 = accept, but ONLY if forwarding is disabled  <- the default, and the trap
+#   2 = accept even when forwarding is enabled      <- what a hypervisor needs
+#
+# A Proxmox node bridges and routes traffic, so the kernel considers it a
+# router and silently ignores the RAs the lab router sends. The node then has
+# a SLAAC address (from the prefix) but no default route, and "IPv6 works
+# locally but not to the internet" is the confusing result.
+- name: Accept Router Advertisements on the management interface even with forwarding enabled
+  ansible.builtin.sysctl:
+    name: "net.ipv6.conf.{{ proxmox_mgmt_interface | replace('.', '/') }}.accept_ra"
+    value: "2"
+    sysctl_set: true
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-proxmox-ipv6.conf
+  when:
+    - proxmox_enable_ipv6
+    - proxmox_force_accept_ra
+    - proxmox_mgmt_ipv6_method == 'auto'
+
+- name: Accept the default route from Router Advertisements
+  ansible.builtin.sysctl:
+    name: "net.ipv6.conf.{{ proxmox_mgmt_interface | replace('.', '/') }}.accept_ra_defrtr"
+    value: "1"
+    sysctl_set: true
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-proxmox-ipv6.conf
+  when:
+    - proxmox_enable_ipv6
+    - proxmox_mgmt_ipv6_method == 'auto'
+
+- name: Ensure IPv6 is not globally disabled
+  ansible.builtin.sysctl:
+    name: "{{ item }}"
+    value: "0"
+    sysctl_set: true
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-proxmox-ipv6.conf
+  loop:
+    - net.ipv6.conf.all.disable_ipv6
+    - net.ipv6.conf.default.disable_ipv6
+  when: proxmox_enable_ipv6
+  # Same reasoning as the router role: a leftover disable_ipv6=1 makes the
+  # addressing above appear configured while the kernel has no IPv6 on the link.
+
+- name: Disable IPv6 when it is explicitly turned off for this node
+  ansible.builtin.sysctl:
+    name: "net.ipv6.conf.{{ proxmox_mgmt_interface | replace('.', '/') }}.disable_ipv6"
+    value: "1"
+    sysctl_set: true
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-proxmox-ipv6.conf
+  when: not proxmox_enable_ipv6
+
+################################################################################
+# Apply now, then confirm the node is still reachable
+################################################################################
+- name: Apply the network configuration now (before anything else depends on it)
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait until the management address is reachable again
+  ansible.builtin.wait_for_connection:
+    delay: 3
+    timeout: 60
+  # If this times out, the new configuration broke connectivity. The backup
+  # file written above is the recovery path (attach a monitor, restore, reload).
+
+- name: Read the resulting addresses on the management interface
+  ansible.builtin.command:
+    cmd: "ip -br addr show {{ proxmox_mgmt_interface }}"
+  register: proxmox_mgmt_addresses
+  changed_when: false
+  failed_when: false

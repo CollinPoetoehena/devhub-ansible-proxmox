@@ -1,0 +1,51 @@
+---
+# templates.yml — Build cloud-init "golden image" VM templates.
+#
+################################################################################
+# Why templates are built here (Ansible) and not in Terraform
+################################################################################
+# Terraform's job in this lab is to declare "these VMs exist, with this CPU,
+# memory, VLAN and cloud-init config". It should never install an operating
+# system: an unattended install takes minutes per VM, depends on a working
+# mirror at apply time, and is exactly the kind of imperative, fragile step
+# that makes a `terraform apply` unpredictable.
+#
+# Instead, Ansible prepares a TEMPLATE once — a cloud image with cloud-init and
+# qemu-guest-agent baked in, marked as a template in Proxmox — and Terraform
+# CLONES it. A clone of a prepared template takes a couple of seconds and is
+# identical every time.
+#
+# What a "cloud image" is: a pre-installed, minimal disk image published by the
+# distribution (Debian genericcloud, Ubuntu cloudimg) that contains cloud-init
+# and nothing else. On first boot cloud-init reads the configuration Proxmox
+# presents on a virtual CD-ROM and applies it: hostname, users, SSH keys,
+# network, packages. That drive is what the Terraform module's `initialization`
+# block populates.
+#
+# WHY qemu-guest-agent is injected into the image (inject_agent):
+# without the agent running inside the VM, the hypervisor cannot read the VM's
+# IP addresses, cannot cleanly shut it down, and cannot quiesce its filesystem
+# for a snapshot. Concretely, the Terraform module's `ipv4_addresses` output
+# stays empty forever and `terraform destroy` falls back to pulling the virtual
+# power cord. It must be present in the IMAGE, because a VM that has not booted
+# yet cannot install it.
+
+- name: Check which template VM ids already exist
+  ansible.builtin.command:
+    cmd: "qm list"
+  register: proxmox_existing_vms
+  changed_when: false
+
+- name: Build each configured template
+  ansible.builtin.include_tasks: template_build.yml
+  loop: "{{ proxmox_vm_templates }}"
+  loop_control:
+    loop_var: template
+    label: "{{ template.vmid }} — {{ template.name }}"
+  when: >-
+    proxmox_force_rebuild_templates | bool
+    or (' ' ~ template.vmid | string ~ ' ') not in (' ' ~ (proxmox_existing_vms.stdout_lines
+        | map('trim') | map('regex_replace', '\\s+.*$', '') | join(' ')) ~ ' ')
+  # Existing templates are never rebuilt unless forced: rebuilding downloads
+  # hundreds of MB and would destroy a template that running VMs were cloned
+  # from (the clone is independent, but the id would be reused).

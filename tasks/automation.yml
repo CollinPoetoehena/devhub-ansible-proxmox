@@ -1,0 +1,323 @@
+---
+# automation.yml — The account Terraform authenticates as.
+#
+################################################################################
+# The design, and why it is not just "use root@pam"
+################################################################################
+# Terraform needs to create, configure, start, stop and destroy VMs on this
+# node. The lazy way is to hand it root@pam's password. That is rejected here
+# for four concrete reasons:
+#
+#   1. Least privilege. Creating a VM does not require the ability to reinstall
+#      the node, rewrite its network, add users or delete the cluster. The
+#      custom role below grants VM/Datastore/Pool privileges and deliberately
+#      omits Sys.Modify, Realm.Allocate, Sys.PowerMgmt and Permissions.Modify.
+#   2. Revocability. An API token can be deleted in one click without touching
+#      any human account or changing anyone's password.
+#   3. Auditability. Every entry in the Proxmox task log carries the token that
+#      performed it, so "what created VM 120 at 03:00" has an answer.
+#   4. Non-interactive by design. A token has no password, no TTY and no 2FA
+#      prompt — which is exactly what an automated apply needs, and is also why
+#      it must never be a human's credentials.
+#
+# THREE things are created here, and they are genuinely different:
+#
+#   a) A PVE ROLE      (TerraformProv)    — a named bundle of privileges.
+#   b) A PVE USER      (terraform@pve)    — the identity, in Proxmox's own user
+#                                           database, plus an API TOKEN on it.
+#   c) A LINUX USER    (terraform)        — a system account used ONLY for the
+#                                           few operations the API does not
+#                                           expose (snippet upload, disk
+#                                           import), which the provider performs
+#                                           over SSH.
+#
+# WHY realm @pve and not @pam:
+#   A @pam user is a real Linux account and would have to exist, with the same
+#   uid and the same authorised keys, on every node. A @pve user lives in
+#   /etc/pve (the replicated cluster filesystem), so it is created once and is
+#   automatically present on every node that later joins the cluster.
+
+################################################################################
+# a) The role — a named bundle of privileges
+################################################################################
+- name: Check whether the automation role already exists
+  ansible.builtin.command:
+    cmd: "pveum role list --output-format json"
+  register: proxmox_existing_roles
+  changed_when: false
+
+- name: Create the automation role ({{ proxmox_automation_role }})
+  ansible.builtin.command:
+    cmd: >-
+      pveum role add {{ proxmox_automation_role }}
+      --privs "{{ proxmox_automation_privileges | join(' ') }}"
+  when: proxmox_automation_role not in (proxmox_existing_roles.stdout | from_json | map(attribute='roleid') | list)
+  changed_when: true
+
+- name: Keep the automation role's privileges in sync
+  ansible.builtin.command:
+    cmd: >-
+      pveum role modify {{ proxmox_automation_role }}
+      --privs "{{ proxmox_automation_privileges | join(' ') }}"
+  when: proxmox_automation_role in (proxmox_existing_roles.stdout | from_json | map(attribute='roleid') | list)
+  changed_when: false
+  # changed_when: false — `pveum role modify` is idempotent in effect but always
+  # exits 0, and there is no cheap way to diff the privilege list. Reporting it
+  # as changed on every run would make the play permanently "yellow" and train
+  # you to ignore real changes. The privileges ARE re-applied every run, which
+  # is the property that matters: the file in git is the source of truth.
+
+################################################################################
+# a2) A group — so future automation identities inherit the same rights
+################################################################################
+# The ACL is attached to a GROUP rather than directly to the user. Adding a
+# second automation identity later (e.g. a separate CI token, or a read-only
+# monitoring account) is then a group membership change instead of a new ACL.
+- name: Check existing groups
+  ansible.builtin.command:
+    cmd: "pveum group list --output-format json"
+  register: proxmox_existing_groups
+  changed_when: false
+
+- name: Create the automation group ({{ proxmox_automation_group }})
+  ansible.builtin.command:
+    cmd: >-
+      pveum group add {{ proxmox_automation_group }}
+      --comment "Automation identities (Terraform, CI). Managed by Ansible."
+  when: proxmox_automation_group not in (proxmox_existing_groups.stdout | from_json | map(attribute='groupid') | list)
+  changed_when: true
+
+################################################################################
+# b) The user
+################################################################################
+- name: Check existing users
+  ansible.builtin.command:
+    cmd: "pveum user list --output-format json"
+  register: proxmox_existing_users
+  changed_when: false
+
+- name: Create the automation user ({{ proxmox_automation_user }})
+  ansible.builtin.command:
+    cmd: >-
+      pveum user add {{ proxmox_automation_user }}
+      --groups {{ proxmox_automation_group }}
+      --comment "Terraform automation account. Managed by Ansible - do not edit in the UI."
+  when: proxmox_automation_user not in (proxmox_existing_users.stdout | from_json | map(attribute='userid') | list)
+  changed_when: true
+  # No --password is set. A @pve user with no password simply cannot log in
+  # interactively, which is exactly what is wanted: the ONLY way to use this
+  # identity is the API token created below.
+
+- name: Ensure the automation user is in the automation group
+  ansible.builtin.command:
+    cmd: "pveum user modify {{ proxmox_automation_user }} --groups {{ proxmox_automation_group }}"
+  changed_when: false
+
+################################################################################
+# a3) The ACL — bind role to group at a path
+################################################################################
+# Path "/" with propagate: Terraform allocates NEW VM ids, which have no ACL
+# path of their own yet, and it reads node and storage status before creating
+# anything. Scoping the ACL to /vms would break `terraform plan` on an empty
+# state. The blast radius is limited by the ROLE (what may be done), not by the
+# path (where) — which is the whole point of the curated privilege list above.
+- name: Read the current ACL
+  ansible.builtin.command:
+    cmd: "pveum acl list --output-format json"
+  register: proxmox_existing_acl
+  changed_when: false
+
+- name: Grant the automation role to the automation group
+  ansible.builtin.command:
+    cmd: >-
+      pveum acl modify {{ proxmox_automation_acl_path }}
+      --groups {{ proxmox_automation_group }}
+      --roles {{ proxmox_automation_role }}
+      {{ '--propagate 1' if proxmox_automation_acl_propagate else '--propagate 0' }}
+  changed_when: false
+  # Idempotent: re-applying an identical ACL entry is a no-op in Proxmox.
+
+################################################################################
+# b2) The API token
+################################################################################
+# A token is a second credential ON an existing user, identified as
+# <user>!<tokenid>, e.g. terraform@pve!automation. Its secret is displayed
+# exactly ONCE, at creation. There is no "show me the token again" — losing it
+# means deleting and recreating the token.
+#
+# privsep (privilege separation):
+#   1 -> the token has its OWN ACL and can never exceed the user's rights.
+#        Used here, because it allows a future second token on the same user
+#        with a narrower scope.
+#   0 -> the token inherits every permission the user has.
+- name: Check whether the API token already exists
+  ansible.builtin.command:
+    cmd: "pveum user token list {{ proxmox_automation_user }} --output-format json"
+  register: proxmox_existing_tokens
+  changed_when: false
+  failed_when: false
+
+- name: Set a fact for whether the token exists
+  ansible.builtin.set_fact:
+    proxmox_token_exists: >-
+      {{ proxmox_automation_token_id in
+         ((proxmox_existing_tokens.stdout | default('[]') | from_json)
+          | map(attribute='tokenid') | list) }}
+
+- name: Remove the existing API token (rotation requested)
+  ansible.builtin.command:
+    cmd: "pveum user token remove {{ proxmox_automation_user }} {{ proxmox_automation_token_id }}"
+  when:
+    - proxmox_rotate_automation_token | bool
+    - proxmox_token_exists | bool
+  changed_when: true
+
+- name: Create the API token
+  ansible.builtin.command:
+    cmd: >-
+      pveum user token add {{ proxmox_automation_user }} {{ proxmox_automation_token_id }}
+      --privsep {{ 1 if proxmox_automation_token_privsep else 0 }}
+      --comment "Terraform. Created by Ansible {{ ansible_date_time.date }}."
+      --output-format json
+  register: proxmox_new_token
+  when: (not proxmox_token_exists | bool) or (proxmox_rotate_automation_token | bool)
+  changed_when: true
+  no_log: true
+  # no_log: the command's OUTPUT contains the secret. Without this it would be
+  # printed in -v output and written to any Ansible log.
+
+- name: Grant the token its own ACL entry (required when privsep is enabled)
+  ansible.builtin.command:
+    cmd: >-
+      pveum acl modify {{ proxmox_automation_acl_path }}
+      --tokens '{{ proxmox_automation_user }}!{{ proxmox_automation_token_id }}'
+      --roles {{ proxmox_automation_role }}
+      {{ '--propagate 1' if proxmox_automation_acl_propagate else '--propagate 0' }}
+  when: proxmox_automation_token_privsep
+  changed_when: false
+  # With privsep=1 the token starts with NO permissions at all, even though its
+  # user has them. Forgetting this task is the number one reason a brand new
+  # token returns "403 Permission check failed" for every Terraform call.
+
+################################################################################
+# Hand the secret over to Terraform
+################################################################################
+# The secret is written to a 0600 file on the ANSIBLE CONTROLLER (not on the
+# node), in `export KEY=value` form, so it can be sourced straight into a
+# Terraform run:
+#
+#   source ansible/.secrets/pve1-terraform-token.env
+#   terraform plan
+#
+# SECURITY: this file is a credential. The directory must be in .gitignore.
+- name: Ensure the secrets directory exists on the controller
+  ansible.builtin.file:
+    path: "{{ proxmox_automation_token_output | dirname }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+  when:
+    - proxmox_write_automation_token_file
+    - proxmox_new_token is defined
+    - proxmox_new_token.changed | default(false)
+
+- name: Write the API token to a local env file for Terraform
+  ansible.builtin.copy:
+    dest: "{{ proxmox_automation_token_output }}"
+    mode: "0600"
+    content: |
+      # Proxmox API token for {{ proxmox_node_name }} — generated by Ansible on {{ ansible_date_time.iso8601 }}
+      # SECRET. Do not commit. Source this file before running Terraform:
+      #   source {{ proxmox_automation_token_output }}
+      export PROXMOX_VE_ENDPOINT="https://{{ proxmox_mgmt_ipv4 }}:8006/"
+      export PROXMOX_VE_API_TOKEN="{{ proxmox_automation_user }}!{{ proxmox_automation_token_id }}={{ (proxmox_new_token.stdout | from_json).value }}"
+      export PROXMOX_VE_INSECURE="true"
+      export PROXMOX_VE_SSH_USERNAME="{{ proxmox_automation_ssh_user }}"
+  delegate_to: localhost
+  become: false
+  no_log: true
+  when:
+    - proxmox_write_automation_token_file
+    - proxmox_new_token is defined
+    - proxmox_new_token.changed | default(false)
+
+- name: Report where the token was written
+  ansible.builtin.debug:
+    msg:
+      - "A NEW API token was created for {{ proxmox_automation_user }}!{{ proxmox_automation_token_id }}."
+      - "The secret was written to: {{ proxmox_automation_token_output }} (mode 0600, on this machine)."
+      - "Proxmox shows a token secret only once — if you lose this file, rotate with:"
+      - "  ansible-playbook site.yml --tags automation -e proxmox_rotate_automation_token=true"
+  when:
+    - proxmox_new_token is defined
+    - proxmox_new_token.changed | default(false)
+
+- name: Report that the token already exists
+  ansible.builtin.debug:
+    msg: >-
+      API token {{ proxmox_automation_user }}!{{ proxmox_automation_token_id }} already
+      exists and was left untouched (its secret cannot be read back). Rotate with
+      -e proxmox_rotate_automation_token=true if it was lost.
+  when:
+    - proxmox_token_exists | bool
+    - not (proxmox_rotate_automation_token | bool)
+
+################################################################################
+# c) The SSH system account
+################################################################################
+# The bpg/proxmox Terraform provider does almost everything over the REST API,
+# but a handful of operations have no API equivalent and are performed over SSH
+# as a real Linux user:
+#   - uploading a cloud-init snippet to a directory storage
+#   - importing a downloaded disk image into a VM
+#
+# This account is therefore NOT a duplicate of the @pve user; it covers a
+# different transport. It gets key-only login and passwordless sudo restricted
+# to the specific binaries the provider calls — a blanket NOPASSWD:ALL would
+# make the carefully curated API role pointless, since the same automation
+# could then do anything as root anyway.
+- name: Create the automation SSH system account
+  ansible.builtin.user:
+    name: "{{ proxmox_automation_ssh_user }}"
+    comment: "Terraform automation (SSH transport). Managed by Ansible."
+    shell: /bin/bash
+    create_home: true
+    system: false
+  when: proxmox_automation_ssh_enabled
+
+- name: Install authorised keys for the automation SSH account
+  ansible.posix.authorized_key:
+    user: "{{ proxmox_automation_ssh_user }}"
+    key: "{{ item }}"
+    state: present
+    exclusive: false
+  loop: "{{ proxmox_automation_ssh_keys }}"
+  loop_control:
+    label: "{{ item | truncate(40, true) }}"
+  when:
+    - proxmox_automation_ssh_enabled
+    - proxmox_automation_ssh_keys | length > 0
+
+- name: Warn when no SSH keys were provided for the automation account
+  ansible.builtin.debug:
+    msg: >-
+      proxmox_automation_ssh_keys is empty, so {{ proxmox_automation_ssh_user }} has no
+      way to log in. Terraform operations that need SSH (snippet upload, disk
+      import) will fail. Set proxmox_automation_ssh_keys in group_vars/proxmox/
+      to the public key you use for the lab (e.g. ~/.ssh/id_homelab.pub).
+  when:
+    - proxmox_automation_ssh_enabled
+    - proxmox_automation_ssh_keys | length == 0
+
+- name: Grant restricted passwordless sudo to the automation SSH account
+  ansible.builtin.template:
+    src: sudoers-automation.j2
+    dest: "/etc/sudoers.d/99-{{ proxmox_automation_ssh_user }}-automation"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: "visudo -cf %s"
+  when: proxmox_automation_ssh_enabled
+  # validate with visudo: a malformed sudoers file makes sudo refuse to run at
+  # all, for everyone, including you. Never write one without validating.

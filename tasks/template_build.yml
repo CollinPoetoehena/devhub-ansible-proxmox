@@ -1,0 +1,179 @@
+---
+# template_build.yml — Build ONE cloud-init template. Included per entry of
+# proxmox_vm_templates by templates.yml (loop variable: `template`).
+#
+# The sequence mirrors what you would do by hand, and each step exists for a
+# reason stated inline:
+#   download -> verify -> inject guest agent -> create VM shell ->
+#   import disk -> attach cloud-init drive -> set boot/serial -> convert to template
+#
+# See for how to use Cloud-Init templates in Proxmox: https://pve.proxmox.com/wiki/Cloud-Init_Support 
+# and https://pve.proxmox.com/wiki/Cloud-Init_FAQ#Creating_a_custom_cloud_image.
+
+################################################################################
+# 1. Download the cloud image
+################################################################################
+- name: "[{{ template.name }}] Download the cloud image"
+  ansible.builtin.get_url:
+    url: "{{ template.url }}"
+    dest: "{{ proxmox_image_cache_dir }}/{{ template.url | basename }}"
+    mode: "0644"
+    checksum: "{{ template.checksum | default(omit) }}"
+    timeout: 120
+  register: proxmox_template_image
+  retries: 2
+  delay: 10
+  until: proxmox_template_image is succeeded
+
+################################################################################
+# 2. Inject qemu-guest-agent into the image
+################################################################################
+# virt-customize mounts the image offline and runs commands inside it. This is
+# the only way to get a package into the image before its first boot.
+#
+# Without the agent: Proxmox cannot read the VM's IP (Terraform's
+# ipv4_addresses output stays empty), cannot do a graceful shutdown, and cannot
+# quiesce the filesystem for consistent snapshots.
+- name: "[{{ template.name }}] Create a working copy of the image"
+  ansible.builtin.copy:
+    src: "{{ proxmox_image_cache_dir }}/{{ template.url | basename }}"
+    dest: "{{ proxmox_image_cache_dir }}/{{ template.name }}.working"
+    remote_src: true
+    mode: "0644"
+  changed_when: true
+  # Work on a copy so the pristine download stays cached and re-usable.
+
+- name: "[{{ template.name }}] Install qemu-guest-agent into the image"
+  ansible.builtin.command:
+    cmd: >-
+      virt-customize -a {{ proxmox_image_cache_dir }}/{{ template.name }}.working
+      --install qemu-guest-agent
+      --run-command "systemctl enable qemu-guest-agent"
+      --truncate /etc/machine-id
+  when: template.inject_agent | default(true)
+  changed_when: true
+  environment:
+    LIBGUESTFS_BACKEND: direct
+    # direct backend: skip libvirt, which is not installed on a Proxmox node.
+  # --truncate /etc/machine-id is essential and easy to miss: if the image ships
+  # with a machine-id, every clone inherits it, and systemd-networkd derives the
+  # DHCP client identifier from it. Every VM would then request the SAME DHCP
+  # lease from the router's dnsmasq and they would fight over one IP address.
+
+################################################################################
+# 3. Create the VM shell
+################################################################################
+# Options chosen and why:
+#   --machine q35        modern chipset with PCIe; required for sane virtio and
+#                        the default for anything not emulating 2009 hardware
+#   --bios ovmf/seabios  SeaBIOS kept for simplicity — cloud images boot on it
+#                        without needing an EFI disk
+#   --cpu host           expose the physical CPU's features to the guest. This
+#                        is a single-node homelab; live migration between
+#                        dissimilar CPUs (the reason to use a generic model) is
+#                        not a concern, and `host` is meaningfully faster
+#   --net0 virtio,bridge paravirtualised NIC on the VLAN-aware bridge. NO tag
+#                        is set here: the VLAN is a per-VM decision made by
+#                        Terraform, not a property of the template
+#   --agent enabled=1    tell the hypervisor to TALK to the guest agent that
+#                        step 2 installed
+#   --serial0 socket +
+#   --vga serial0        cloud images log their boot to the serial console;
+#                        without this, `qm terminal <id>` shows nothing and a
+#                        VM that fails to get an IP is undebuggable
+- name: "[{{ template.name }}] Create the template VM shell (id {{ template.vmid }})"
+  ansible.builtin.command:
+    cmd: >-
+      qm create {{ template.vmid }}
+      --name {{ template.name }}
+      --machine q35
+      --ostype l26
+      --cores {{ template.cores | default(2) }}
+      --memory {{ template.memory | default(2048) }}
+      --cpu host
+      --net0 virtio,bridge={{ proxmox_bridge_name }}
+      --agent enabled=1,fstrim_cloned_disks=1
+      --serial0 socket
+      --vga serial0
+      --scsihw virtio-scsi-single
+      --description "Cloud-init template built by Ansible on {{ ansible_date_time.date }}. Cloned by Terraform - do not start or modify."
+  changed_when: true
+
+################################################################################
+# 4. Import the disk and attach it
+################################################################################
+- name: "[{{ template.name }}] Import the cloud image as the VM's disk"
+  ansible.builtin.command:
+    cmd: >-
+      qm importdisk {{ template.vmid }}
+      {{ proxmox_image_cache_dir }}/{{ template.name }}.working
+      {{ proxmox_vm_storage }}
+      --format qcow2
+  changed_when: true
+  register: proxmox_import_result
+  failed_when:
+    - proxmox_import_result.rc != 0
+    - "'already exists' not in proxmox_import_result.stderr"
+
+- name: "[{{ template.name }}] Attach the imported disk to the SCSI controller"
+  ansible.builtin.command:
+    cmd: >-
+      qm set {{ template.vmid }}
+      --scsi0 {{ proxmox_vm_storage }}:vm-{{ template.vmid }}-disk-0,discard=on,ssd=1
+  changed_when: true
+  # discard=on + ssd=1: let the guest issue TRIM so deleted blocks are actually
+  # released back to the thin pool. Without it a thin-provisioned pool only ever
+  # grows, and on a laptop SSD that fills up fast.
+
+- name: "[{{ template.name }}] Resize the disk to {{ template.disk_size | default('20G') }}"
+  ansible.builtin.command:
+    cmd: "qm disk resize {{ template.vmid }} scsi0 {{ template.disk_size | default('20G') }}"
+  changed_when: true
+  failed_when: false
+  # Cloud images ship tiny (2-4 GB). Growing the disk HERE, in the template,
+  # means every clone starts at a usable size; cloud-init grows the filesystem
+  # to fill it on first boot. Terraform can still grow it further per VM.
+
+################################################################################
+# 5. Cloud-init drive and boot order
+################################################################################
+# The cloud-init drive is a small virtual CD-ROM that Proxmox regenerates from
+# the VM's cloud-init settings. It is where user-data, network config and SSH
+# keys are handed to the guest. A template WITHOUT this drive produces clones
+# that ignore every cloud-init setting Terraform sets — silently.
+- name: "[{{ template.name }}] Attach the cloud-init drive"
+  ansible.builtin.command:
+    cmd: "qm set {{ template.vmid }} --ide2 {{ proxmox_vm_storage }}:cloudinit"
+  changed_when: true
+
+- name: "[{{ template.name }}] Set the boot order to the imported disk"
+  ansible.builtin.command:
+    cmd: "qm set {{ template.vmid }} --boot order=scsi0"
+  changed_when: true
+  # Explicit boot order: without it the VM may try the (empty) cloud-init
+  # CD-ROM or the network first and hang at the boot prompt.
+
+- name: "[{{ template.name }}] Enable the QEMU guest agent and DHCP defaults"
+  ansible.builtin.command:
+    cmd: "qm set {{ template.vmid }} --ipconfig0 ip=dhcp,ip6=auto"
+  changed_when: true
+  # A sane dual-stack default baked into the template: IPv4 from the router's
+  # dnsmasq DHCP, IPv6 via SLAAC from its Router Advertisements. Terraform
+  # overrides this per VM when a static address is wanted.
+
+################################################################################
+# 6. Convert to a template
+################################################################################
+# Converting makes the VM read-only and enables LINKED clones: a linked clone
+# stores only its differences from the template instead of a full copy, so a
+# 20 GB template plus ten VMs costs far less than 200 GB. It is also what stops
+# anyone accidentally booting and modifying the golden image.
+- name: "[{{ template.name }}] Convert the VM into a template"
+  ansible.builtin.command:
+    cmd: "qm template {{ template.vmid }}"
+  changed_when: true
+
+- name: "[{{ template.name }}] Remove the working image copy"
+  ansible.builtin.file:
+    path: "{{ proxmox_image_cache_dir }}/{{ template.name }}.working"
+    state: absent

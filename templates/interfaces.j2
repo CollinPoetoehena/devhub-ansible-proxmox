@@ -1,0 +1,177 @@
+# {{ ansible_managed }}
+#
+# /etc/network/interfaces for {{ proxmox_node_name }}.{{ proxmox_domain }}
+# Managed by the `proxmox` Ansible role — do not edit manually.
+#
+###############################################################################
+# FILE FORMAT — ifupdown(2) basics used below
+###############################################################################
+# - `auto <iface>`   : bring this interface up at boot (and on `ifreload -a`).
+#                      Without it, an interface is only configured when it is
+#                      brought up by hand with `ifup`.
+# - `iface <iface> <family> <method>`
+#                      family = inet (IPv4) | inet6 (IPv6)
+#                      method = static | dhcp | manual | auto
+#                      `manual` means "bring the link up but assign no
+#                      address" — used for the physical NIC, which is only a
+#                      bridge member and must never hold an IP itself.
+# - Indented lines below an `iface` stanza are OPTIONS for that stanza
+#   (address, gateway, bridge-*, ...). Indentation is what associates them.
+# - An interface can have BOTH an `inet` and an `inet6` stanza; they are
+#   independent and that is exactly how dual-stack is expressed here.
+#
+###############################################################################
+# Topology on this node
+###############################################################################
+#  lab switch (trunk: untagged 1 + tagged 10/20/30)
+#        |
+#   {{ '%-14s' | format(proxmox_physical_interface) }} physical NIC — no IP, bridge member only
+#        |
+#   {{ '%-14s' | format(proxmox_bridge_name) }} VLAN-AWARE bridge — VM NICs attach here and carry
+#                  their own VLAN tag (set by Terraform per VM)
+#        |
+#   {{ '%-14s' | format(proxmox_mgmt_interface) }} the NODE's own management address (VLAN {{ proxmox_mgmt_vlan_id }})
+#
+# The node has NO address on {{ proxmox_bridge_name }} itself: that would be the
+# untagged native VLAN, which carries no production traffic in this lab.
+
+source /etc/network/interfaces.d/*
+
+###############################################################################
+# Loopback
+###############################################################################
+auto lo
+iface lo inet loopback
+iface lo inet6 loopback
+
+###############################################################################
+# Physical interface — bridge member, no address in either family
+###############################################################################
+# `manual` = bring the link up, assign nothing. The interface exists only to
+# carry tagged frames into the bridge. Giving it an address here would put the
+# node on the native VLAN and defeat the "everything is explicitly tagged"
+# design.
+auto {{ proxmox_physical_interface }}
+iface {{ proxmox_physical_interface }} inet manual
+
+###############################################################################
+# vmbr0 — VLAN-aware bridge
+###############################################################################
+# bridge-ports        : which interfaces are members of this bridge
+# bridge-stp off      : Spanning Tree disabled. There is exactly one uplink and
+#                       no possible loop; STP would only add ~30s of forwarding
+#                       delay after every link change (long enough for a
+#                       booting VM's DHCP request to time out).
+# bridge-fd 0         : forwarding delay 0 — same reason; start forwarding
+#                       immediately instead of waiting out the listen/learn
+#                       states STP would otherwise require.
+# bridge-vlan-aware   : THE important one. The bridge understands 802.1Q tags
+#                       and keeps them, so a VM NIC tagged `vlan_id = 20` lands
+#                       on VLAN 20 on the wire. Without this, every VLAN would
+#                       need its own bridge and a VM could not be moved between
+#                       VLANs without re-cabling its virtual NIC.
+# bridge-vids         : which VLAN IDs the bridge accepts on its trunk ports.
+auto {{ proxmox_bridge_name }}
+iface {{ proxmox_bridge_name }} inet manual
+	bridge-ports {{ proxmox_physical_interface }}
+	bridge-stp off
+	bridge-fd 0
+{% if proxmox_bridge_vlan_aware %}
+	bridge-vlan-aware yes
+	bridge-vids {{ proxmox_bridge_vlan_ids }}
+{% endif %}
+{% if proxmox_enable_ipv6 %}
+	# No IPv6 on the untagged bridge either: accept_ra 0 makes sure the node
+	# never autoconfigures an address from a rogue RA arriving untagged.
+	post-up sysctl -q -w net.ipv6.conf.{{ proxmox_bridge_name | replace('.', '/') }}.accept_ra=0 || true
+{% endif %}
+
+###############################################################################
+# Management VLAN {{ proxmox_mgmt_vlan_id }} — the node's own address
+###############################################################################
+# Naming an interface `<bridge>.<vid>` on a VLAN-aware bridge creates a VLAN
+# sub-interface of that bridge: frames leaving it are tagged with {{ proxmox_mgmt_vlan_id }},
+# frames arriving tagged {{ proxmox_mgmt_vlan_id }} are delivered to it untagged.
+# This is how the hypervisor puts ITSELF on a VLAN, and it mirrors the router's
+# eth1.{{ proxmox_mgmt_vlan_id }} sub-interface on the other end of the trunk.
+#
+# IPv4 is STATIC (not DHCP) on purpose: the Proxmox API endpoint, the
+# certificate SANs, corosync's link address and every firewall rule referencing
+# this node all want an address that cannot change. The router additionally
+# holds a matching static DHCP lease (router_static_leases) so nothing else can
+# ever be handed this address.
+auto {{ proxmox_mgmt_interface }}
+iface {{ proxmox_mgmt_interface }} inet static
+	address {{ proxmox_mgmt_ipv4 }}/{{ proxmox_mgmt_ipv4_cidr }}
+	gateway {{ proxmox_mgmt_gateway }}
+{% if proxmox_bridge_vlan_aware %}
+	# Explicitly restate the parent bridge and VLAN id. ifupdown2 can infer
+	# both from the interface name, but stating them makes the file readable
+	# without knowing that convention.
+	vlan-raw-device {{ proxmox_bridge_name }}
+	vlan-id {{ proxmox_mgmt_vlan_id }}
+{% endif %}
+	# Nameserver is the lab router (dnsmasq). It resolves lab hostnames
+	# (pve1.{{ proxmox_domain }}) locally and forwards everything else upstream.
+	dns-nameservers {{ proxmox_mgmt_gateway }}
+	dns-search {{ proxmox_domain }}
+{% if proxmox_enable_ipv6 %}
+{% if proxmox_mgmt_ipv6_method == 'auto' %}
+
+# IPv6 on the management VLAN: SLAAC, from the router's Router Advertisements.
+#
+# WHY `auto` and not a static ULA:
+#   - the router (dnsmasq, `ra-names`) already publishes an AAAA record for the
+#     address the node derives, so DNS works with zero extra configuration;
+#   - the lab's stated habit is to reference devices by NAME over IPv6 rather
+#     than hard-coding literals — static v6 here would undercut that;
+#   - the address is stable anyway, because the kernel uses stable-privacy
+#     addressing (same prefix + same interface = same address).
+#
+# accept_ra must be 2, not the default 1, because this node forwards packets.
+# The sysctl is also set persistently in /etc/sysctl.d/99-proxmox-ipv6.conf by
+# the role; it is repeated here as a post-up so a manual `ifreload` on a node
+# that has not re-read sysctl.d still behaves correctly.
+iface {{ proxmox_mgmt_interface }} inet6 auto
+	accept_ra 2
+	pre-up sysctl -q -w net.ipv6.conf.{{ proxmox_mgmt_interface | replace('.', '/') }}.accept_ra=2 || true
+{% elif proxmox_mgmt_ipv6_method == 'static' %}
+
+# IPv6 on the management VLAN: static ULA address.
+# Only used when a node must have a fixed v6 literal (e.g. it is referenced by
+# an external system that cannot do DNS). The gateway is the router's per-VLAN
+# ::1 address.
+iface {{ proxmox_mgmt_interface }} inet6 static
+	address {{ proxmox_mgmt_ipv6 }}/{{ proxmox_mgmt_ipv6_cidr }}
+	gateway {{ proxmox_mgmt_gateway_ipv6 | default('fd42:' ~ proxmox_mgmt_vlan_id ~ '::1') }}
+	accept_ra 0
+{% endif %}
+{% endif %}
+
+{% for extra in proxmox_extra_interfaces | default([]) %}
+###############################################################################
+# Extra interface: {{ extra.name }}{{ (' — ' ~ extra.comment) if extra.comment is defined else '' }}
+###############################################################################
+# Rendered from proxmox_extra_interfaces — the escape hatch for anything this
+# role's standard layout does not cover (a second NIC, a storage VLAN, a
+# dedicated corosync link, ...). Adding one is a host_vars change only.
+auto {{ extra.name }}
+iface {{ extra.name }} inet {{ extra.method | default('manual') }}
+{% if extra.address is defined %}
+	address {{ extra.address }}
+{% endif %}
+{% if extra.gateway is defined %}
+	gateway {{ extra.gateway }}
+{% endif %}
+{% if extra.vlan_raw_device is defined %}
+	vlan-raw-device {{ extra.vlan_raw_device }}
+{% endif %}
+{% for option in extra.options | default([]) %}
+	{{ option }}
+{% endfor %}
+{% if extra.address6 is defined %}
+
+iface {{ extra.name }} inet6 static
+	address {{ extra.address6 }}
+{% endif %}
+{% endfor %}

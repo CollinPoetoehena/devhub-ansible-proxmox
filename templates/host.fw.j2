@@ -1,0 +1,67 @@
+# {{ ansible_managed }}
+#
+# Host firewall for {{ proxmox_node_name }}.
+# Managed by the `proxmox` Ansible role — do not edit in the web UI.
+#
+# RULE SYNTAX:
+#   <direction> <action> -source <cidr|+ipset> -p <proto> -dport <port> # comment
+#   direction: IN | OUT
+#   action:    ACCEPT | DROP | REJECT
+# Rules are evaluated top to bottom, first match wins — the same model as
+# nftables on the router role: https://github.com/CollinPoetoehena/devhub-ansible-router.
+
+[OPTIONS]
+
+enable: 1
+
+# Log packets that hit the default policy. Same purpose as the router's
+# rate-limited nft log rules: without it, "the connection just hangs" has no
+# evidence anywhere. Visible with `tail -f /var/log/pve-firewall.log`.
+log_level_in: info
+log_level_out: nolog
+
+# nosmurfs/tcpflags: drop malformed and spoofed traffic before any rule is
+# evaluated. Equivalent in spirit to the router's `ct state invalid drop`.
+nosmurfs: 1
+tcpflags: 1
+
+[RULES]
+
+# --- Management access -------------------------------------------------------
+# Only the management VLAN may reach SSH, the web UI/API and the console proxy.
+# A compromised service VM on VLAN 20 therefore cannot even attempt to log in to
+# the hypervisor that is running it.
+{% for port in proxmox_firewall_allowed_tcp_ports %}
+{% for src in proxmox_firewall_management_sources %}
+IN ACCEPT -source {{ src }} -p tcp -dport {{ port }} # management access ({{ 'SSH' if port == 22 else ('Proxmox API/UI' if port == 8006 else ('SPICE console' if port == 3128 else 'management')) }})
+{% endfor %}
+{% endfor %}
+
+{% if proxmox_cluster_enabled %}
+# --- Corosync (cluster membership) -------------------------------------------
+# UDP, between cluster members only. Corosync is extremely latency sensitive
+# and losing these packets causes a node to be fenced out of the cluster.
+{% for port in proxmox_firewall_cluster_udp_ports %}
+{% for src in proxmox_firewall_management_sources %}
+IN ACCEPT -source {{ src }} -p udp -dport {{ port }} # corosync cluster traffic
+{% endfor %}
+{% endfor %}
+{% endif %}
+
+# --- ICMP --------------------------------------------------------------------
+# Ping and, critically, ICMPv6. Blocking ICMPv6 does not harden an IPv6 network,
+# it breaks it: Neighbour Discovery replaces ARP and Packet Too Big is what
+# makes Path MTU Discovery work. Same rationale as 30-default.nft on the router.
+IN ACCEPT -p icmp # IPv4 ping (troubleshooting and monitoring probes)
+{% if proxmox_enable_ipv6 %}
+IN ACCEPT -p icmpv6 # IPv6 ND / PMTUD / ping — required, not optional
+{% endif %}
+
+# --- DHCP / SLAAC replies ----------------------------------------------------
+# The node is a DHCP *client* on the management VLAN for its IPv6 configuration.
+IN ACCEPT -p udp -dport 68 # DHCPv4 client replies
+{% if proxmox_enable_ipv6 %}
+IN ACCEPT -p udp -dport 546 # DHCPv6 client replies
+{% endif %}
+
+# Everything else falls through to policy_in: DROP from cluster.fw.

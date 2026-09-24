@@ -1,2 +1,66 @@
 ---
 # handlers file for devhub-ansible-proxmox
+#
+# Handlers run once, at the end of the play (or when explicitly flushed with
+# `meta: flush_handlers`), and only when a task actually reported a change. That
+# is what keeps a re-run of this role from bouncing the network or restarting
+# the API on a node where nothing was modified.
+
+################################################################################
+# Network
+################################################################################
+# `ifreload -a` applies the DIFFERENCE between /etc/network/interfaces and the
+# running configuration, without bringing every interface down first. Compared
+# to the classic `systemctl restart networking` (which does a full down/up and
+# drops your SSH session even when nothing about your path changed), this is
+# both faster and far less likely to lock you out of a headless node.
+#
+# The file has already been validated with `ifreload --syntax-check` in
+# networking.yml before this handler can ever fire, so a syntax error never
+# reaches the running system.
+- name: Reload network configuration
+  ansible.builtin.command:
+    cmd: ifreload -a
+  changed_when: true
+  # async/poll are deliberately NOT used: the management address is static and
+  # does not change on a re-run, so the SSH session survives the reload.
+
+################################################################################
+# APT
+################################################################################
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+
+################################################################################
+# Proxmox services
+################################################################################
+# pveproxy serves the web UI and the REST API that Terraform talks to.
+# Restarted after the subscription-nag patch (a static JS file it serves).
+- name: Restart pveproxy
+  ansible.builtin.systemd:
+    name: pveproxy
+    state: restarted
+
+# pve-cluster owns /etc/pve (the replicated cluster filesystem where users,
+# tokens, ACLs and VM configs live). Restarted after a hostname or /etc/hosts
+# change, because it resolves the node's own FQDN at startup.
+- name: Restart pve-cluster
+  ansible.builtin.systemd:
+    name: pve-cluster
+    state: restarted
+
+- name: Restart pvedaemon
+  ansible.builtin.systemd:
+    name: pvedaemon
+    state: restarted
+
+- name: Restart sshd
+  ansible.builtin.systemd:
+    name: ssh
+    state: restarted
+
+- name: Reload pve-firewall
+  ansible.builtin.command:
+    cmd: pve-firewall restart
+  changed_when: true
