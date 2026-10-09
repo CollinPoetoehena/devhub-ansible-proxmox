@@ -24,6 +24,12 @@
 # That is a Proxmox constraint, not a limitation of this role. Cluster first,
 # create VMs second.
 
+################################################################################
+# Membership probe and join safety
+################################################################################
+# pvecm status returns nonzero on standalone nodes. Treat that as the expected
+# "not clustered" branch here; VM listing and cluster creation still fail
+# normally if their CLI commands cannot execute.
 - name: Check whether this node is already in a cluster
   ansible.builtin.command:
     cmd: "pvecm status"
@@ -53,6 +59,8 @@
         - proxmox_vms_present.stdout_lines | length > 1
         - inventory_hostname != proxmox_cluster_primary
   when: not proxmox_in_cluster
+  # The primary keeps its local configuration when creating a cluster. The
+  # destructive replacement applies to joining secondaries, hence the guard.
 
 ################################################################################
 # Create the cluster (primary node only)
@@ -80,6 +88,8 @@
   delay: 5
   changed_when: false
   when: inventory_hostname == proxmox_cluster_primary
+  # /etc/pve must be writable before later tasks can create API identities or
+  # templates. Allow corosync time to settle instead of racing the first write.
 
 ################################################################################
 # Join (every other node)

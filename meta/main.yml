@@ -1,6 +1,6 @@
 galaxy_info:
   author: CollinPoetoehena
-  description: Configure Proxmox cluster settings and an infrastructure automation API account
+  description: Configure Proxmox clusters, cloud-init VM templates, and an infrastructure automation API account
   min_ansible_version: "2.14"
   platforms:
     - name: Debian

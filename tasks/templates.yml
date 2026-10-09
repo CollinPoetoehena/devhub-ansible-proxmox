@@ -1,0 +1,100 @@
+---
+# templates.yml - Validate the image catalog and build each requested template.
+#
+################################################################################
+# Why a cloud image becomes a template
+################################################################################
+# A cloud image already contains Linux and cloud-init. Importing its disk and
+# attaching Proxmox's cloud-init drive produces a cloneable base for any IaC
+# client; no installer ISO, baked-in SSH key, or running golden VM is needed.
+# This file is opt-in through proxmox_build_templates in main.yml.
+
+################################################################################
+# Validate the entire catalog before touching storage or creating a VM
+################################################################################
+- name: Validate template catalog and storage inputs
+  ansible.builtin.assert:
+    that:
+      - proxmox_vm_templates is sequence and proxmox_vm_templates is not string and proxmox_vm_templates is not mapping
+      - proxmox_vm_templates | length > 0
+      - proxmox_vm_storage is match('^[A-Za-z][A-Za-z0-9_-]*$')
+      - proxmox_bridge_name is match('^[A-Za-z][A-Za-z0-9_.-]*$')
+      - proxmox_image_cache_dir is match('^/[^,\r\n]+$')
+      - not (proxmox_enable_snippets | bool) or proxmox_snippets_storage is match('^[A-Za-z][A-Za-z0-9_-]*$')
+    fail_msg: "Provide a non-empty proxmox_vm_templates list, valid storage/bridge names, and an absolute image cache path without commas."
+  # Proxmox disk options are comma-separated, so a comma in the import path
+  # would change the meaning of --scsi0 even though command uses argv.
+
+- name: Require template entries to be mappings
+  ansible.builtin.assert:
+    that:
+      - proxmox_template is mapping
+    fail_msg: "Each proxmox_vm_templates entry must be a mapping."
+  loop: "{{ proxmox_vm_templates }}"
+  loop_control:
+    loop_var: proxmox_template
+
+- name: Validate each cloud-init template definition
+  ansible.builtin.assert:
+    that:
+      - proxmox_template.vmid is defined and (proxmox_template.vmid | string) is match('^[1-9][0-9]{2,8}$')
+      - proxmox_template.name is defined and proxmox_template.name is match('^[A-Za-z0-9][A-Za-z0-9-]{0,62}$')
+      - proxmox_template.url is defined and proxmox_template.url is match('^https://[^\s,]+$')
+      - (proxmox_template.url | urlsplit('path') | basename) is match('^[A-Za-z0-9_.-]+\.(img|qcow2)$')
+      - proxmox_template.checksum is defined and proxmox_template.checksum is match('^(sha256:([A-Fa-f0-9]{64}|https://[^\s]+)|sha512:([A-Fa-f0-9]{128}|https://[^\s]+))$')
+      - (proxmox_template.cores | default(2) | string) is match('^[1-9][0-9]*$')
+      - (proxmox_template.memory | default(1024) | string) is match('^[1-9][0-9]*$')
+      - proxmox_template.bridge | default(proxmox_bridge_name) is match('^[A-Za-z][A-Za-z0-9_.-]*$')
+      - proxmox_template.agent | default(false) is boolean
+    fail_msg: >-
+      Each template needs a VM ID (100-999999999), a DNS-compatible name,
+      an HTTPS .img/.qcow2 URL and a sha256/sha512 checksum or HTTPS checksum
+      manifest. Optional cores/memory must be positive integers, bridge a
+      valid interface name, and agent a boolean.
+  loop: "{{ proxmox_vm_templates }}"
+  loop_control:
+    loop_var: proxmox_template
+    label: "{{ proxmox_template.name | default('invalid template') }}"
+
+- name: Require unique template VM IDs and names
+  ansible.builtin.assert:
+    that:
+      - proxmox_vm_templates | map(attribute='vmid') | map('int') | unique | length == proxmox_vm_templates | length
+      - proxmox_vm_templates | map(attribute='name') | unique | length == proxmox_vm_templates | length
+    fail_msg: "Template VM IDs and names must be unique in proxmox_vm_templates."
+
+################################################################################
+# Runtime preparation and per-image build
+################################################################################
+# qm/pvesh are not predictive in check mode. Validate the inputs above but
+# do not download images or feed skipped command results into JSON parsers.
+- name: Explain template check-mode limitations
+  ansible.builtin.debug:
+    msg: "Template inputs are valid. Check mode skips storage, downloads and VM commands; run normally on Proxmox to verify those."
+  when: ansible_check_mode
+
+- name: Prepare storage and build templates
+  when: not ansible_check_mode
+  block:
+    - name: Require cluster membership before creating templates when clustering is enabled
+      ansible.builtin.command:
+        argv: [pvecm, status]
+      changed_when: false
+      when: proxmox_cluster_enabled | bool
+      # A secondary awaiting its manual join must not get new VMs: joining
+      # would replace their configuration. This also guards tag-limited runs.
+
+    - name: Prepare image and snippet storage
+      ansible.builtin.import_tasks: storage.yml
+
+    - name: Build each cloud-init template
+      ansible.builtin.include_tasks:
+        file: template_build.yml
+        apply:
+          tags: [proxmox, templates]
+      loop: "{{ proxmox_vm_templates }}"
+      loop_control:
+        loop_var: proxmox_template
+        label: "{{ proxmox_template.name }}"
+      # Dynamic includes need apply.tags so --tags templates also executes
+      # the tasks inside the per-template file, not only the include itself.

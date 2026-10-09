@@ -1,0 +1,96 @@
+---
+# storage.yml - Verify disk storage, enable snippets, and prepare the cache.
+#
+################################################################################
+# Existing storage is a prerequisite, not something this role creates
+################################################################################
+# The ISO install normally supplies local (directory) and local-lvm (VM disks).
+# Custom installations may differ. Query Proxmox's structured configuration
+# instead of grepping storage.cfg or guessing paths such as /var/lib/vz.
+- name: Read the VM disk storage configuration
+  ansible.builtin.command:
+    argv: [pvesh, get, "/storage/{{ proxmox_vm_storage }}", --output-format, json]
+  register: proxmox_disk_storage_config
+  changed_when: false
+
+- name: Read the VM disk storage status on this node
+  ansible.builtin.command:
+    argv: [pvesh, get, "/nodes/{{ ansible_facts['hostname'] }}/storage/{{ proxmox_vm_storage }}/status", --output-format, json]
+  register: proxmox_disk_storage_status
+  changed_when: false
+
+- name: Require active storage that accepts VM disks
+  ansible.builtin.assert:
+    that:
+      - "'images' in ((proxmox_disk_storage_config.stdout | from_json).content | default('')).split(',')"
+      - (proxmox_disk_storage_status.stdout | from_json).active | bool
+      - (proxmox_disk_storage_status.stdout | from_json).enabled | bool
+    fail_msg: "Storage {{ proxmox_vm_storage }} must be active, enabled on this node, and accept images. Check pvesm status."
+  # A storage can exist cluster-wide but be disabled or unavailable on this
+  # particular node; its name alone is not enough to make disk import safe.
+
+################################################################################
+# Custom cloud-init data needs the snippets content type
+################################################################################
+# Proxmox-generated user/network data needs only the cloud-init CD-ROM.
+# Custom user-data and vendor-data need file-backed snippet storage as well.
+- name: Configure optional snippet storage
+  when: proxmox_enable_snippets | bool
+  block:
+    - name: Read the snippet storage configuration
+      ansible.builtin.command:
+        argv: [pvesh, get, "/storage/{{ proxmox_snippets_storage }}", --output-format, json]
+      register: proxmox_snippet_storage_config
+      changed_when: false
+
+    - name: Read the snippet storage status on this node
+      ansible.builtin.command:
+        argv: [pvesh, get, "/nodes/{{ ansible_facts['hostname'] }}/storage/{{ proxmox_snippets_storage }}/status", --output-format, json]
+      register: proxmox_snippet_storage_status
+      changed_when: false
+
+    - name: Require active directory-backed snippet storage
+      ansible.builtin.assert:
+        that:
+          - (proxmox_snippet_storage_config.stdout | from_json).type == 'dir'
+          - (proxmox_snippet_storage_config.stdout | from_json).path is match('^/')
+          - (proxmox_snippet_storage_status.stdout | from_json).active | bool
+          - (proxmox_snippet_storage_status.stdout | from_json).enabled | bool
+        fail_msg: "Snippet storage {{ proxmox_snippets_storage }} must be an active dir storage on this node; LVM-thin cannot hold snippet files."
+
+    - name: Enable snippets while preserving all existing content types
+      ansible.builtin.command:
+        argv:
+          - pvesm
+          - set
+          - "{{ proxmox_snippets_storage }}"
+          - --content
+          - "{{ (((proxmox_snippet_storage_config.stdout | from_json).content | default('')).split(',') + ['snippets']) | reject('equalto', '') | unique | join(',') }}"
+      when: "'snippets' not in ((proxmox_snippet_storage_config.stdout | from_json).content | default('')).split(',')"
+      changed_when: true
+      throttle: 1
+      # --content replaces the list; setting only snippets would disable ISO
+      # and backup uploads. pvesm applies this directly, without a daemon restart.
+
+    - name: Create the snippets directory under the configured storage path
+      ansible.builtin.file:
+        path: "{{ (proxmox_snippet_storage_config.stdout | from_json).path }}/snippets"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      # This does not grant the API user a Linux login or upload mechanism.
+      # Clients must arrange a supported upload path and suitable permissions.
+
+################################################################################
+# Keep downloaded images separate from imported VM disks
+################################################################################
+# Per-definition subdirectories in template_build.yml avoid filename collisions
+# between different distributions/releases which use the same image basename.
+- name: Ensure the cloud image cache directory exists
+  ansible.builtin.file:
+    path: "{{ proxmox_image_cache_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"

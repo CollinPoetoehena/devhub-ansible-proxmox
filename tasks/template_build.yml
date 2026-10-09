@@ -1,0 +1,185 @@
+---
+# template_build.yml - Build one immutable cloud-init base from the image catalog.
+#
+# Included by templates.yml with loop variable proxmox_template. The workflow is
+# inspect -> verify ownership -> download -> create/import -> convert -> verify.
+# No task starts a guest, destroys an existing VM, or rebuilds a used template.
+
+################################################################################
+# Identify this definition and protect existing guests cluster-wide
+################################################################################
+- name: Resolve the template's optional settings
+  ansible.builtin.set_fact:
+    proxmox_template_definition: >-
+      {{ {'cores': 2, 'memory': 1024, 'bridge': proxmox_bridge_name, 'agent': false}
+         | combine(proxmox_template) }}
+
+- name: Calculate the managed template marker and cache path
+  ansible.builtin.set_fact:
+    proxmox_template_marker: >-
+      devhub.proxmox cloud-init {{ {'template': proxmox_template_definition, 'storage': proxmox_vm_storage}
+      | to_json(sort_keys=true) | hash('sha256') }}
+    proxmox_template_cache: >-
+      {{ proxmox_image_cache_dir }}/{{ proxmox_template_definition.url | hash('sha256') }}
+  # A stable marker makes re-runs safe and detects definition changes. Rolling
+  # image URLs are not refresh instructions: new images use a new VM ID/name.
+
+- name: List cluster-wide guests before allocating a template VM ID
+  ansible.builtin.command:
+    argv: [pvesh, get, /cluster/resources, --type, vm, --output-format, json]
+  register: proxmox_template_guests
+  changed_when: false
+
+- name: Find any guest using this template VM ID
+  ansible.builtin.set_fact:
+    proxmox_template_existing: >-
+      {{ proxmox_template_guests.stdout | from_json
+         | selectattr('vmid', 'equalto', proxmox_template_definition.vmid | int) | list }}
+
+- name: Refuse a VM ID used by a container or another node
+  ansible.builtin.assert:
+    that:
+      - proxmox_template_existing | length <= 1
+      - >-
+        proxmox_template_existing | length == 0 or
+        (proxmox_template_existing[0].type == 'qemu' and
+         proxmox_template_existing[0].node == ansible_facts['hostname'])
+    fail_msg: "VM ID {{ proxmox_template_definition.vmid }} is already used elsewhere in the cluster. Choose a free cluster-wide ID."
+
+- name: Read an existing local template configuration
+  ansible.builtin.command:
+    argv: [pvesh, get, "/nodes/{{ ansible_facts['hostname'] }}/qemu/{{ proxmox_template_definition.vmid }}/config", --output-format, json]
+  register: proxmox_template_existing_config
+  changed_when: false
+  when: proxmox_template_existing | length > 0
+
+- name: Refuse to overwrite an unrelated or changed template definition
+  ansible.builtin.assert:
+    that:
+      - (proxmox_template_existing_config.stdout | from_json).description | default('') == proxmox_template_marker
+      - (proxmox_template_existing_config.stdout | from_json).name == proxmox_template_definition.name
+      - (proxmox_template_existing_config.stdout | from_json).scsi0 is defined
+      - "'cloudinit' in ((proxmox_template_existing_config.stdout | from_json).ide2 | default(''))"
+      - (proxmox_template_existing_config.stdout | from_json).boot | default('') == 'order=scsi0'
+    fail_msg: >-
+      VM ID {{ proxmox_template_definition.vmid }} is not a complete VM owned
+      by this template definition. Nothing was overwritten. Inspect it manually,
+      or choose a new VM ID/name for a changed image or template configuration.
+  when: proxmox_template_existing | length > 0
+  # A matching, fully configured VM whose conversion was interrupted can be
+  # resumed. Incomplete imports need manual inspection, never blind re-import.
+
+################################################################################
+# Download and import only when the VM ID is genuinely unused
+################################################################################
+- name: Create and import the new template VM
+  when: proxmox_template_existing | length == 0
+  block:
+    - name: Verify the template bridge exists on this node
+      ansible.builtin.command:
+        argv: [pvesh, get, "/nodes/{{ ansible_facts['hostname'] }}/network/{{ proxmox_template_definition.bridge }}", --output-format, json]
+      register: proxmox_template_bridge
+      changed_when: false
+
+    - name: Require an existing Linux bridge
+      ansible.builtin.assert:
+        that:
+          - (proxmox_template_bridge.stdout | from_json).type == 'bridge'
+          - (proxmox_template_bridge.stdout | from_json).active | default(0) | bool
+        fail_msg: "Bridge {{ proxmox_template_definition.bridge }} is not active. Configure host networking separately."
+
+    - name: Create a cache directory for this image URL
+      ansible.builtin.file:
+        path: "{{ proxmox_template_cache }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Download and checksum-verify the pristine cloud image
+      ansible.builtin.get_url:
+        url: "{{ proxmox_template_definition.url }}"
+        dest: "{{ proxmox_template_cache }}/{{ proxmox_template_definition.url | urlsplit('path') | basename }}"
+        checksum: "{{ proxmox_template_definition.checksum }}"
+        owner: root
+        group: root
+        mode: "0644"
+        timeout: 120
+      # get_url verifies cached files too. Never mutate the verified download
+      # with virt-customize; this lightweight role imports vendor images as-is.
+
+    - name: Create the VM with imported disk and cloud-init drive
+      ansible.builtin.command:
+        argv:
+          - qm
+          - create
+          - "{{ proxmox_template_definition.vmid | string }}"
+          - --name
+          - "{{ proxmox_template_definition.name }}"
+          - --description
+          - "{{ proxmox_template_marker }}"
+          - --ostype
+          - l26
+          - --cores
+          - "{{ proxmox_template_definition.cores | string }}"
+          - --memory
+          - "{{ proxmox_template_definition.memory | string }}"
+          - --net0
+          - "virtio,bridge={{ proxmox_template_definition.bridge }}"
+          - --scsihw
+          - virtio-scsi-pci
+          - --scsi0
+          - "{{ proxmox_vm_storage }}:0,import-from={{ proxmox_template_cache }}/{{ proxmox_template_definition.url | urlsplit('path') | basename }}"
+          - --ide2
+          - "{{ proxmox_vm_storage }}:cloudinit"
+          - --boot
+          - order=scsi0
+          - --serial0
+          - socket
+          - --vga
+          - serial0
+          - --ipconfig0
+          - ip=dhcp
+          - --agent
+          - "{{ 'enabled=1' if proxmox_template_definition.agent else 'enabled=0' }}"
+      changed_when: true
+      # import-from lets Proxmox allocate and attach the disk itself. Do not
+      # guess vm-<id>-disk-0: naming differs across storage backends.
+      # The virtio NIC is untagged; VLANs, keys and per-VM cloud-init data belong
+      # to the cloning client. Serial output keeps headless guests debuggable.
+
+################################################################################
+# Convert without booting, then verify the handoff to infrastructure automation
+################################################################################
+- name: Convert the prepared VM into a template
+  ansible.builtin.command:
+    argv: [qm, template, "{{ proxmox_template_definition.vmid | string }}"]
+  when: >-
+    proxmox_template_existing | length == 0 or
+    not ((proxmox_template_existing_config.stdout | from_json).template | default(0) | bool)
+  changed_when: true
+  # Templates cannot be started directly. Clones get their own cloud-init
+  # identity on first boot; the base never consumes the image's first boot.
+
+- name: Read the completed template configuration
+  ansible.builtin.command:
+    argv: [pvesh, get, "/nodes/{{ ansible_facts['hostname'] }}/qemu/{{ proxmox_template_definition.vmid }}/config", --output-format, json]
+  register: proxmox_template_final_config
+  changed_when: false
+
+- name: Verify the template is cloneable and has cloud-init hardware
+  ansible.builtin.assert:
+    that:
+      - (proxmox_template_final_config.stdout | from_json).template | default(0) | bool
+      - (proxmox_template_final_config.stdout | from_json).scsi0 is defined
+      - "'cloudinit' in ((proxmox_template_final_config.stdout | from_json).ide2 | default(''))"
+      - (proxmox_template_final_config.stdout | from_json).boot == 'order=scsi0'
+    fail_msg: "Template {{ proxmox_template_definition.vmid }} is incomplete; inspect qm config before allowing clients to clone it."
+
+- name: Report the template available for cloning
+  ansible.builtin.debug:
+    msg: >-
+      Cloud-init template {{ proxmox_template_definition.name }}
+      (VM ID {{ proxmox_template_definition.vmid }}) is ready on
+      {{ ansible_facts['hostname'] }} using {{ proxmox_vm_storage }}.
+      Clone it, supply SSH keys and cloud-init settings, then start the clone.

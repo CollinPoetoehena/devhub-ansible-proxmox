@@ -1,12 +1,30 @@
 ---
+# main.yml - Entry point for the deliberately small Proxmox role.
+#
+################################################################################
+# Execution order and scope
+################################################################################
+# Validate first, cluster before creating any VMs, then prepare optional
+# templates and the API identity that will clone them. Joining a cluster can
+# replace local VM configuration, so templates must not precede clustering.
+# This role does not manage host networking, repositories, or hardening.
+
 - name: Validate the Proxmox target and API endpoint
   ansible.builtin.import_tasks: preflight.yml
   tags: [always]
+  # Even a tag-limited run must refuse an accidental non-Proxmox target.
 
 - name: Configure the cluster
   ansible.builtin.import_tasks: cluster.yml
   when: proxmox_cluster_enabled | bool
   tags: [proxmox, cluster]
+
+- name: Prepare cloud-init templates for infrastructure automation
+  ansible.builtin.import_tasks: templates.yml
+  when: proxmox_build_templates | bool
+  tags: [proxmox, templates]
+  # The flag is required even with --tags templates; tags select tasks,
+  # they do not opt the node into downloading images or allocating disks.
 
 - name: Configure the infrastructure automation API account
   ansible.builtin.import_tasks: automation.yml

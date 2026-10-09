@@ -11,6 +11,38 @@ proxmox_cluster_name: homelab
 proxmox_cluster_primary: "{{ groups['proxmox'] | first }}"
 proxmox_cluster_link_address: "{{ proxmox_mgmt_ipv4 | default(omit) }}"
 
+################################################################################
+# Cloud-init VM templates (opt-in)
+################################################################################
+# Templates are prepared on the hypervisor, then cloned by the IaC client.
+# Keeping this disabled preserves the simplified role's default behavior:
+# no image downloads, storage changes, or VM creation unless requested.
+proxmox_build_templates: false
+proxmox_vm_storage: local-lvm
+proxmox_bridge_name: vmbr0
+proxmox_image_cache_dir: /var/lib/vz/template/cloud-images
+
+# Custom cloud-init user/vendor data needs file-backed snippet storage.
+# This is only configured when template building is enabled. Disable it if
+# clients will use only Proxmox's generated cloud-init settings.
+proxmox_enable_snippets: true
+proxmox_snippets_storage: local
+
+# Additional Linux cloud images use the same list entry format. VM IDs must
+# be unique across the entire cluster, including containers and other nodes.
+# A checksum is mandatory: use sha256:<digest>, sha512:<digest>, or an HTTPS
+# checksum-file URL prefixed by its algorithm, as below.
+#
+# Optional fields: cores (2), memory in MiB (1024), bridge (the variable above),
+# agent (false). Enabling agent only enables the Proxmox channel; the guest
+# must actually install qemu-guest-agent through cloud-init or a prepared image.
+# The role never boots images, installs packages inside them, or adds keys.
+proxmox_vm_templates:
+  - vmid: 9000
+    name: ubuntu-2404-minimal-cloudinit
+    url: https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img
+    checksum: sha256:https://cloud-images.ubuntu.com/minimal/releases/noble/release/SHA256SUMS
+
 # Least-privilege account and API token for infrastructure automation clients.
 proxmox_automation_user: automation@pve
 proxmox_automation_token_id: automation

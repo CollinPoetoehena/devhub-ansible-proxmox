@@ -1,4 +1,20 @@
 ---
+# automation.yml - Tool-neutral API identity, scoped privileges, and token handoff.
+#
+################################################################################
+# Why automation gets its own identity
+################################################################################
+# IaC clients should clone/provision VMs, not authenticate as root@pam. A custom
+# role makes the permission boundary explicit, a group holds the user ACL, and
+# a revocable token keeps unattended clients separate from human logins.
+# This creates a Proxmox @pve identity, NOT a Linux user or SSH account.
+
+################################################################################
+# Custom privilege role
+################################################################################
+# Read the catalog before creating objects so a normal re-run does not try to
+# add duplicates. Existing role privileges are synchronized to the configured
+# list; add new capabilities deliberately rather than granting Administrator.
 - name: List existing Proxmox roles
   ansible.builtin.command:
     cmd: pveum role list --output-format json
@@ -20,7 +36,14 @@
       --privs "{{ proxmox_automation_privileges | join(' ') }}"
   when: proxmox_automation_role in (proxmox_existing_roles.stdout | from_json | map(attribute='roleid') | list)
   changed_when: false
+  # The CLI reapplies the desired list. This existing task does not calculate
+  # a privilege diff, so its changed flag is not proof that no ACL drift existed.
 
+################################################################################
+# Group and API user
+################################################################################
+# @pve users can authenticate with API tokens without an operating-system
+# password. Group membership lets the ACL policy outlive a particular token.
 - name: List existing Proxmox groups
   ansible.builtin.command:
     cmd: pveum group list --output-format json
@@ -55,6 +78,11 @@
     cmd: "pveum user modify {{ proxmox_automation_user }} --groups {{ proxmox_automation_group }}"
   changed_when: false
 
+################################################################################
+# User-side ACL and token lifecycle
+################################################################################
+# With privilege separation, effective access is the intersection of user
+# and token permissions. Granting only one side produces authorization failures.
 - name: Grant the least-privilege role to the automation group
   ansible.builtin.command:
     cmd: >-
@@ -83,6 +111,8 @@
     - proxmox_rotate_automation_token | bool
     - proxmox_token_exists | bool
   changed_when: true
+  # Rotation is explicitly destructive to this token: running clients using
+  # its old secret immediately lose access. It is never done on normal re-runs.
 
 - name: Create the API token
   ansible.builtin.command:
@@ -95,6 +125,8 @@
   when: not (proxmox_token_exists | bool) or (proxmox_rotate_automation_token | bool)
   changed_when: true
   no_log: true
+  # Proxmox returns the secret only at creation; no_log prevents accidental
+  # disclosure in Ansible output, including verbose output and failed tasks.
 
 - name: Grant the API token its own ACL when privilege separation is enabled
   ansible.builtin.command:
@@ -106,6 +138,13 @@
   when: proxmox_automation_token_privsep | bool
   changed_when: false
 
+################################################################################
+# One-time handoff on the Ansible controller
+################################################################################
+# Store secrets locally, not on the hypervisor. The file is only written for
+# a newly created/rotated token because existing secrets cannot be read back.
+# Owner-only permissions are intentional; neither debug messages nor diffs
+# should contain the secret. Client-specific environment names live only here.
 - name: Create the local secrets directory
   ansible.builtin.file:
     path: "{{ proxmox_automation_token_output | dirname }}"
@@ -116,6 +155,8 @@
   when:
     - proxmox_write_automation_token_file | bool
     - proxmox_new_token.changed | default(false)
+  # Delegation must not inherit become: true from the hypervisor play; the
+  # controller-side credential belongs to the user running Ansible.
 
 - name: Save the new API token for IaC clients
   ansible.builtin.copy:
@@ -140,6 +181,11 @@
       - "Proxmox displays token secrets only once; rotate with proxmox_rotate_automation_token=true if lost."
   when: proxmox_new_token.changed | default(false)
 
+################################################################################
+# Repeat runs preserve credentials
+################################################################################
+# Report only the token identity. Losing its secret requires explicit rotation,
+# not an attempt to query it or silently replace a working client's credential.
 - name: Report that the existing token was left unchanged
   ansible.builtin.debug:
     msg: >-
