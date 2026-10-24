@@ -1,6 +1,7 @@
 # devhub-ansible-proxmox
 
-> Part of [DevHub/Ansible](https://github.com/CollinPoetoehena/DevHub/blob/main/packages/Ansible.md) — see that file for conventions, structure guidelines, and the full role index.
+> For shared package design and engineering practices, see
+[DevHub's Engineering & Coding Reference](https://github.com/CollinPoetoehena/DevHub/blob/main/reference/engineering/README.md). This README covers this package's setup, usage, design decisions, and exceptions.
 
 Prepares an existing Proxmox VE installation for infrastructure automation: optional clustering, optional cloud-init VM templates and snippet storage, and a least-privilege, tool-neutral API identity.
 

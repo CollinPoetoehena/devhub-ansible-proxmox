@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `devhub-ansible-proxmox` are documented here. See for details about versioning: [Versioning Documentation](https://github.com/CollinPoetoehena/DevHub/blob/main/packages/README.md#versioning).
+All notable changes to `devhub-ansible-proxmox` are documented here.
 
 ## [1.0.0] — 2026-09-TODO
 
