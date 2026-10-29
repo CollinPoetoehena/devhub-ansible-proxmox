@@ -1,0 +1,30 @@
+---
+# preflight.yml - Reject the wrong host before changing Proxmox state.
+#
+################################################################################
+# Proxmox host guard
+################################################################################
+# Debian alone is not sufficient: the remaining tasks call Proxmox-specific
+# tools and write cluster configuration. Check the installed VE marker rather
+# than assuming the inventory group proves that this is a hypervisor.
+- name: Check for the Proxmox VE marker
+  ansible.builtin.stat:
+    path: /usr/bin/pveversion
+  register: proxmox_pveversion_binary
+
+- name: Refuse to run on a non-Proxmox host
+  ansible.builtin.fail:
+    msg: "{{ inventory_hostname }} is missing /usr/bin/pveversion; target this role only at Proxmox VE hosts."
+  when: not proxmox_pveversion_binary.stat.exists
+
+################################################################################
+# API endpoint input
+################################################################################
+# The management address also supplies the default corosync link address.
+# Requiring it here gives a useful error instead of an undefined-variable
+# failure later when the role writes the controller-side token file.
+- name: Require a management IPv4 address for the API endpoint
+  ansible.builtin.assert:
+    that:
+      - proxmox_mgmt_ipv4 is defined and proxmox_mgmt_ipv4 | ansible.utils.ipv4
+    fail_msg: "Set proxmox_mgmt_ipv4 to this node's management IPv4 address in host_vars."
