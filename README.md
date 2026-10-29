@@ -1,5 +1,7 @@
 # devhub-ansible-proxmox
 
+> **Archived:** This role is no longer maintained and used. Initially, I used it to configure Proxmox. However, this is not meant to be a role, it is used on my specific homelab setup only and it does not contain any generic/general aspects. So, it does not make sense to add it as a separate role, it is better off inside the homelab repo itself as a playbook or task, etc. This is because it saves the additional maintenance of a separate repository, especially because it does not really add any value in this case. Therefore, it is archived on GitHub and the code is simplified to a playbook, a role is not necessary anymore as mentioned above.
+
 > For shared package design and engineering practices, see
 [DevHub's Engineering & Coding Reference](https://github.com/CollinPoetoehena/DevHub/blob/main/reference/engineering/README.md). This README covers this package's setup, usage, design decisions, and exceptions.
 
